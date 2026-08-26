@@ -21,9 +21,12 @@ public sealed class App : IExternalApplication
     {
         try
         {
-            RibbonPanel panel = application.GetRibbonPanels(Autodesk.Revit.UI.Tab.Systems)
+            // Revit 2025's public ribbon API only supports creating custom panels on Add-Ins
+            // (and a limited set of standard tabs). Create the fully functional panel there first,
+            // then move the already-wired ribbon panel into Systems through Autodesk's loaded UI.
+            RibbonPanel panel = application.GetRibbonPanels()
                 .FirstOrDefault(p => string.Equals(p.Name, PanelName, StringComparison.OrdinalIgnoreCase))
-                ?? application.CreateRibbonPanel(Autodesk.Revit.UI.Tab.Systems, PanelName);
+                ?? application.CreateRibbonPanel(PanelName);
 
             string assemblyPath = Assembly.GetExecutingAssembly().Location;
             var buttonData = new PushButtonData(
@@ -37,15 +40,18 @@ public sealed class App : IExternalApplication
             buttonData.LargeImage = LoadImage(Icon32Base64);
             buttonData.Image = LoadImage(Icon16Base64);
 
-            var item = panel.AddItem(buttonData) as PushButton;
-            if (item != null)
-                item.AvailabilityClassName = typeof(FlexConduitAvailability).FullName;
+            // Avoid duplicate controls if Revit invokes startup in an unusual reload scenario.
+            if (panel.GetItems().All(i => !string.Equals(i.Name, "RevitFlexConduit.Create", StringComparison.OrdinalIgnoreCase)))
+            {
+                var item = panel.AddItem(buttonData) as PushButton;
+                if (item != null)
+                    item.AvailabilityClassName = typeof(FlexConduitAvailability).FullName;
+            }
 
-            // Revit's supported API appends custom panels to a standard tab. Reorder the
-            // custom Flex Conduit panel immediately after the built-in Electrical panel that
-            // contains Conduit Fitting(s). The button itself cannot be inserted into Autodesk's
-            // built-in Electrical panel through the supported API.
-            TryPlacePanelAfterConduitFittings(PanelName);
+            // Move the complete custom panel from Add-Ins into Systems immediately after the
+            // built-in panel containing Conduit Fitting(s). If Autodesk changes the internal
+            // ribbon implementation, the command remains safely available on Add-Ins.
+            TryMovePanelToSystemsAfterConduitFittings(PanelName);
 
             return Result.Succeeded;
         }
@@ -53,7 +59,7 @@ public sealed class App : IExternalApplication
         {
             TaskDialog.Show(
                 $"Flex Conduit v{ProductVersion}",
-                "The Flex Conduit control could not be added to Revit's Systems tab.\n\n" + ex.Message);
+                "The Flex Conduit ribbon control could not be created.\n\n" + ex.Message);
             return Result.Failed;
         }
     }
@@ -73,7 +79,7 @@ public sealed class App : IExternalApplication
         return image;
     }
 
-    private static void TryPlacePanelAfterConduitFittings(string ourPanelTitle)
+    private static bool TryMovePanelToSystemsAfterConduitFittings(string ourPanelTitle)
     {
         try
         {
@@ -83,41 +89,105 @@ public sealed class App : IExternalApplication
 
             Type? componentManager = adWindows.GetType("Autodesk.Windows.ComponentManager");
             object? ribbon = componentManager?.GetProperty("Ribbon", BindingFlags.Public | BindingFlags.Static)?.GetValue(null);
-            if (ribbon == null) return;
+            if (ribbon == null) return false;
 
             object? tabsObject = ribbon.GetType().GetProperty("Tabs")?.GetValue(ribbon);
             var tabs = Enumerate(tabsObject).ToList();
-            object? systems = tabs.FirstOrDefault(t =>
-                TextProperty(t, "Name").Equals("Systems", StringComparison.OrdinalIgnoreCase) ||
-                TextProperty(t, "Title").Equals("Systems", StringComparison.OrdinalIgnoreCase) ||
-                TextProperty(t, "Id").Contains("Systems", StringComparison.OrdinalIgnoreCase));
-            if (systems == null) return;
+            if (tabs.Count == 0) return false;
 
-            object? panelsObject = systems.GetType().GetProperty("Panels")?.GetValue(systems);
-            if (panelsObject == null) return;
-            var panels = Enumerate(panelsObject).ToList();
-            object? ours = panels.FirstOrDefault(p => GetPanelTitle(p).Equals(ourPanelTitle, StringComparison.OrdinalIgnoreCase));
-            if (ours == null) return;
+            object? systemsTab = tabs.FirstOrDefault(IsSystemsTab);
+            if (systemsTab == null) return false;
 
-            int targetIndex = panels.FindIndex(PanelContainsConduitFitting);
-            int ourIndex = panels.IndexOf(ours);
-            if (targetIndex < 0 || ourIndex < 0 || ourIndex == targetIndex + 1) return;
+            object? sourceTab = null;
+            object? ourPanel = null;
+            object? sourcePanelsObject = null;
 
-            MethodInfo? remove = panelsObject.GetType().GetMethod("Remove", new[] { ours.GetType() });
-            remove ??= panelsObject.GetType().GetMethods().FirstOrDefault(m => m.Name == "Remove" && m.GetParameters().Length == 1);
-            MethodInfo? insert = panelsObject.GetType().GetMethods().FirstOrDefault(m => m.Name == "Insert" && m.GetParameters().Length == 2);
-            if (remove == null || insert == null) return;
+            foreach (object tab in tabs)
+            {
+                object? panelsObject = tab.GetType().GetProperty("Panels")?.GetValue(tab);
+                foreach (object candidate in Enumerate(panelsObject))
+                {
+                    if (GetPanelTitle(candidate).Equals(ourPanelTitle, StringComparison.OrdinalIgnoreCase))
+                    {
+                        sourceTab = tab;
+                        ourPanel = candidate;
+                        sourcePanelsObject = panelsObject;
+                        break;
+                    }
+                }
 
-            remove.Invoke(panelsObject, new[] { ours });
-            panels = Enumerate(panelsObject).ToList();
-            targetIndex = panels.FindIndex(PanelContainsConduitFitting);
-            int insertIndex = targetIndex >= 0 ? targetIndex + 1 : panels.Count;
-            insert.Invoke(panelsObject, new object[] { insertIndex, ours });
+                if (ourPanel != null) break;
+            }
+
+            if (ourPanel == null || sourcePanelsObject == null) return false;
+
+            object? systemsPanelsObject = systemsTab.GetType().GetProperty("Panels")?.GetValue(systemsTab);
+            if (systemsPanelsObject == null) return false;
+
+            var targetPanels = Enumerate(systemsPanelsObject).ToList();
+            int targetIndex = targetPanels.FindIndex(PanelContainsConduitFitting);
+            if (targetIndex < 0)
+            {
+                // English Revit's electrical ribbon panel normally contains Conduit Fitting.
+                // As a fallback, place Flex Conduit after a panel titled Electrical.
+                targetIndex = targetPanels.FindIndex(p =>
+                    GetPanelTitle(p).Contains("Electrical", StringComparison.OrdinalIgnoreCase));
+            }
+
+            bool alreadyOnSystems = ReferenceEquals(sourceTab, systemsTab);
+            int currentIndex = targetPanels.IndexOf(ourPanel);
+            if (alreadyOnSystems && targetIndex >= 0 && currentIndex == targetIndex + 1)
+                return true;
+
+            MethodInfo? remove = FindCollectionMethod(sourcePanelsObject, "Remove", 1);
+            MethodInfo? insert = FindCollectionMethod(systemsPanelsObject, "Insert", 2);
+            MethodInfo? add = FindCollectionMethod(systemsPanelsObject, "Add", 1);
+            if (remove == null || (insert == null && add == null)) return false;
+
+            remove.Invoke(sourcePanelsObject, new[] { ourPanel });
+
+            targetPanels = Enumerate(systemsPanelsObject).ToList();
+            targetIndex = targetPanels.FindIndex(PanelContainsConduitFitting);
+            if (targetIndex < 0)
+                targetIndex = targetPanels.FindIndex(p => GetPanelTitle(p).Contains("Electrical", StringComparison.OrdinalIgnoreCase));
+
+            if (insert != null)
+            {
+                int insertIndex = targetIndex >= 0 ? Math.Min(targetIndex + 1, targetPanels.Count) : targetPanels.Count;
+                insert.Invoke(systemsPanelsObject, new object[] { insertIndex, ourPanel });
+            }
+            else
+            {
+                add!.Invoke(systemsPanelsObject, new[] { ourPanel });
+            }
+
+            return true;
         }
         catch
         {
-            // UI reordering uses Autodesk's internal ribbon object. Failure must never stop Revit.
+            // This uses Autodesk's internal ribbon model solely to reposition a panel. If the
+            // internal API changes, never block Revit startup; the panel stays on Add-Ins.
+            return false;
         }
+    }
+
+    private static MethodInfo? FindCollectionMethod(object collection, string name, int parameterCount)
+        => collection.GetType().GetMethods()
+            .FirstOrDefault(m => m.Name == name && m.GetParameters().Length == parameterCount);
+
+    private static bool IsSystemsTab(object tab)
+    {
+        string identity = string.Join(" ", new[]
+        {
+            TextProperty(tab, "Name"),
+            TextProperty(tab, "Title"),
+            TextProperty(tab, "Id"),
+            TextProperty(tab, "AutomationName")
+        });
+
+        return identity.Contains("Systems", StringComparison.OrdinalIgnoreCase) ||
+               identity.Contains("System", StringComparison.OrdinalIgnoreCase) &&
+               !identity.Contains("System Browser", StringComparison.OrdinalIgnoreCase);
     }
 
     private static bool PanelContainsConduitFitting(object panel)
@@ -149,7 +219,13 @@ public sealed class App : IExternalApplication
     private static string GetPanelTitle(object panel)
     {
         object? source = panel.GetType().GetProperty("Source")?.GetValue(panel);
-        return source == null ? string.Empty : TextProperty(source, "Title");
+        if (source != null)
+        {
+            string title = TextProperty(source, "Title");
+            if (!string.IsNullOrWhiteSpace(title)) return title;
+        }
+
+        return TextProperty(panel, "Title");
     }
 
     private static string TextProperty(object obj, string property)
