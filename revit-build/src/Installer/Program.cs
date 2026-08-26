@@ -20,7 +20,7 @@ internal sealed class InstallerForm : Form
     private readonly ProgressBar _progress = new();
 
     private const string ProductName = "Revit Flex Conduit 2025";
-    private const string ProductVersion = "2.0.0";
+    private const string ProductVersion = "2.1.0";
     private const string DllFileName = "RevitFlexConduit.dll";
     private const string AddinFileName = "RevitFlexConduit2025-v2.addin";
     private const string VersionFileName = "version.txt";
@@ -72,7 +72,7 @@ internal sealed class InstallerForm : Form
         });
         header.Controls.Add(new Label
         {
-            Text = $"Version {ProductVersion} • interactive routing • Systems ribbon integration",
+            Text = $"Version {ProductVersion} • spline routing • persistent control points",
             ForeColor = Color.FromArgb(215, 224, 239),
             AutoSize = true,
             Location = new Point(31, 58)
@@ -97,9 +97,9 @@ internal sealed class InstallerForm : Form
         {
             Text = "Installs for the current Windows user only.\r\n\r\n" +
                    "• Removes older per-user Flex Conduit manifests and DLLs first\r\n" +
-                   "• Uses Revit's standard Systems-tab API (not the old Electrical Tools tab)\r\n" +
-                   "• Adds the Flex Conduit panel after the conduit-fitting/electrical area when available\r\n" +
-                   "• Includes visible control points and interactive route updates\r\n" +
+                   "• Uses a true smooth spline instead of visible straight conduit segments\r\n" +
+                   "• Keeps control-point markers visible and editable after creation\r\n" +
+                   "• Places Flex Conduit on Systems after the conduit-fitting area when available\r\n" +
                    "• Does not require administrator permissions\r\n" +
                    "• Close Revit before installing or uninstalling",
             AutoSize = true,
@@ -229,17 +229,18 @@ internal sealed class InstallerForm : Form
             message.AppendLine();
             message.AppendLine("Restart Revit 2025 completely.");
             message.AppendLine();
-            message.AppendLine("Expected after restart:");
-            message.AppendLine("• This add-in no longer creates the old Electrical Tools tab.");
-            message.AppendLine("• Flex Conduit appears on the Systems tab.");
-            message.AppendLine($"• Hover the button and confirm the tooltip says v{ProductVersion}.");
+            message.AppendLine("New in this version:");
+            message.AppendLine("• The visible flex run is one smooth spline instead of straight line segments.");
+            message.AppendLine("• Control points stay visible after creation.");
+            message.AppendLine("• Select a control point and run Flex Conduit to move that point.");
+            message.AppendLine($"• Hover the ribbon button and confirm the tooltip says v{ProductVersion}.");
 
             if (!string.IsNullOrWhiteSpace(systemDuplicate))
             {
                 message.AppendLine();
                 message.AppendLine("IMPORTANT: A second system-wide Flex Conduit manifest was detected:");
                 message.AppendLine(systemDuplicate);
-                message.AppendLine("That older system-wide copy may also need to be removed if Revit still shows the old tab.");
+                message.AppendLine("That older system-wide copy may also need to be removed if Revit still shows the old version.");
             }
 
             MessageBox.Show(
@@ -309,8 +310,6 @@ internal sealed class InstallerForm : Form
             }
             catch
             {
-                // Continue cleaning other legacy manifests. A locked file will be reported later
-                // if it prevents the new manifest from being installed correctly.
             }
         }
     }
@@ -333,7 +332,6 @@ internal sealed class InstallerForm : Form
             }
             catch
             {
-                // Ignore unreadable unrelated manifests.
             }
         }
 
