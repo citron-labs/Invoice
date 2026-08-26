@@ -85,7 +85,10 @@ public sealed class FlexConduitCommand : IExternalCommand
 
             XYZ end = uidoc.Selection.PickPoint(snaps, "Flex Conduit: pick END/control point");
             if (start.DistanceTo(end) < MinSegmentFeet)
-                throw new RevitOperationCanceledException("The start and end control points are too close together.");
+            {
+                CleanupPreview(doc, state, true);
+                return Result.Cancelled;
+            }
 
             controlPoints.Add(end);
             RefreshRouteAndMarkers(doc, uidoc.ActiveView, state, controlPoints, settings, runId);
@@ -199,7 +202,11 @@ public sealed class FlexConduitCommand : IExternalCommand
 
             XYZ second = uidoc.Selection.PickPoint(snaps, "Flex Conduit: pick NEW END/control point");
             if (controlPoints[0].DistanceTo(second) < MinSegmentFeet)
-                throw new RevitOperationCanceledException("The start and end control points are too close together.");
+            {
+                DeleteMarkers(doc, state);
+                return Result.Cancelled;
+            }
+
             controlPoints.Add(second);
             RefreshRouteAndMarkers(doc, uidoc.ActiveView, state, controlPoints, settings, runId);
 
@@ -444,8 +451,7 @@ public sealed class FlexConduitCommand : IExternalCommand
     }
 
     private static Connector? Closest(Conduit conduit, XYZ point)
-        => conduit.ConnectorManager.Connectors
-            .Cast<Connector>()
+        => conduit.ConnectorManager.Connectors.Cast<Connector>()
             .OrderBy(c => c.Origin.DistanceTo(point))
             .FirstOrDefault();
 
@@ -498,12 +504,9 @@ public sealed class FlexConduitCommand : IExternalCommand
 
     private static List<ElementId> FindRunElementIds(Document doc, string runId)
     {
-        return new FilteredElementCollector(doc)
-            .OfClass(typeof(Conduit))
-            .Cast<Conduit>()
+        return new FilteredElementCollector(doc).OfClass(typeof(Conduit)).Cast<Conduit>()
             .Where(c => TryReadRunData(c, out string candidate, out _) && candidate == runId)
-            .Select(c => c.Id)
-            .ToList();
+            .Select(c => c.Id).ToList();
     }
 
     private static string SerializePoints(IReadOnlyList<XYZ> points)
