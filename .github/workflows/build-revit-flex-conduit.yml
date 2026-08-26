@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - 'chatgpt/revit-flex-conduit-2025-*'
+  pull_request:
   workflow_dispatch:
 
 jobs:
