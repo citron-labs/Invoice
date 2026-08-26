@@ -85,7 +85,7 @@ public sealed class FlexConduitCommand : IExternalCommand
 
             XYZ end = uidoc.Selection.PickPoint(snaps, "Flex Conduit: pick END/control point");
             if (start.DistanceTo(end) < MinSegmentFeet)
-                throw new RevitOperationCanceledException();
+                throw new RevitOperationCanceledException("The start and end control points are too close together.");
 
             controlPoints.Add(end);
             RefreshRouteAndMarkers(doc, uidoc.ActiveView, state, controlPoints, settings, runId);
@@ -199,7 +199,7 @@ public sealed class FlexConduitCommand : IExternalCommand
 
             XYZ second = uidoc.Selection.PickPoint(snaps, "Flex Conduit: pick NEW END/control point");
             if (controlPoints[0].DistanceTo(second) < MinSegmentFeet)
-                throw new RevitOperationCanceledException();
+                throw new RevitOperationCanceledException("The start and end control points are too close together.");
             controlPoints.Add(second);
             RefreshRouteAndMarkers(doc, uidoc.ActiveView, state, controlPoints, settings, runId);
 
@@ -363,8 +363,6 @@ public sealed class FlexConduitCommand : IExternalCommand
                 perpendicular = XYZ.BasisY;
             perpendicular = perpendicular.Normalize();
 
-            // Small automatic slack makes a two-point run read visually as flexible rather than
-            // as ordinary rigid conduit. Additional user control points override this default shape.
             double bow = Math.Min(distance * 0.06, 0.50);
             XYZ c1 = start + delta.Multiply(0.33) + perpendicular.Multiply(bow);
             XYZ c2 = start + delta.Multiply(0.66) + perpendicular.Multiply(bow);
@@ -441,8 +439,6 @@ public sealed class FlexConduitCommand : IExternalCommand
             }
             catch
             {
-                // Coincident native conduit segments still form the visible flex path even when
-                // Revit declines to make a logical connector connection at a very small angle.
             }
         }
     }
