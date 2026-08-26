@@ -11,8 +11,8 @@ namespace RevitFlexConduit;
 
 public sealed class App : IExternalApplication
 {
-    internal const string TabName = "Systems";
     internal const string PanelName = "Flex Conduit";
+    internal const string ProductVersion = "2.0.0";
 
     private const string Icon32Base64 = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAA9ElEQVR4nO2Wyw3DIAyGcdWR2nt2YIGMxgLZIfeyEz1BE2I7GFtBqvLfAtj+/CDCuVtKpdUljf3DCmQIgDZ7NYCFhgM8ew3Pyv+al7IfgwfqnEkFaphtcOzbHKA1mBkAVX4uOLVH9qY22vYRA3iHhXN1UPZHAmDE2aj1/p9BxeABBeBK+Zl9S2wH0y85yl8MHi75D3DX8LAhnWKsIjDhrcVmqulHFIMHKRjlp17bLXCDh52RZE+pzEBL8LxG9VQafAcgFTdYYoDW7DlBR/YFoEcWjxEVwFbQmX0BqMstKb8muEppdcmqDUODD38TdmlY6W/9pb5e8HLetjA3HgAAAABJRU5ErkJggg==";
     private const string Icon16Base64 = "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAgklEQVR4nL1Syw2AIAx9JY6Ed3dgAUZzAXbgrjvVgykh5eOH6LuQtO+XFOBrcAT39mY0oGug060PRZvbDUSsTQqDWoqeWR9YZtQibt5Vm9ACynmpQS25JgaAfXXpnTRJljNOw1YT4VGeLkNBfgVJ1zBPqjfRMrn6hV1wBA8bvBb/igPTjT8qNv3lxAAAAABJRU5ErkJggg==";
@@ -21,23 +21,9 @@ public sealed class App : IExternalApplication
     {
         try
         {
-            RibbonPanel panel;
-            try
-            {
-                panel = application.GetRibbonPanels(TabName)
-                    .FirstOrDefault(p => string.Equals(p.Name, PanelName, StringComparison.OrdinalIgnoreCase))
-                    ?? application.CreateRibbonPanel(TabName, PanelName);
-            }
-            catch
-            {
-                // English Revit 2025 uses the built-in Systems tab. If Autodesk changes/localizes
-                // the tab identifier, keep the add-in available rather than failing startup.
-                const string fallbackTab = "Electrical Tools";
-                try { application.CreateRibbonTab(fallbackTab); } catch { }
-                panel = application.GetRibbonPanels(fallbackTab)
-                    .FirstOrDefault(p => string.Equals(p.Name, PanelName, StringComparison.OrdinalIgnoreCase))
-                    ?? application.CreateRibbonPanel(fallbackTab, PanelName);
-            }
+            RibbonPanel panel = application.GetRibbonPanels(Autodesk.Revit.UI.Tab.Systems)
+                .FirstOrDefault(p => string.Equals(p.Name, PanelName, StringComparison.OrdinalIgnoreCase))
+                ?? application.CreateRibbonPanel(Autodesk.Revit.UI.Tab.Systems, PanelName);
 
             string assemblyPath = Assembly.GetExecutingAssembly().Location;
             var buttonData = new PushButtonData(
@@ -46,8 +32,8 @@ public sealed class App : IExternalApplication
                 assemblyPath,
                 typeof(FlexConduitCommand).FullName!);
 
-            buttonData.ToolTip = "Create or reshape an electrical flex-conduit run with visible control points and automatic smooth routing.";
-            buttonData.LongDescription = "Pick a start point and additional control points. The conduit is created and refreshed while you work, so the route stays visible. Select an existing Flex Conduit run and launch the same command to reshape it.";
+            buttonData.ToolTip = $"Flex Conduit v{ProductVersion} — create or reshape an electrical flex-conduit run with visible control points and automatic smooth routing.";
+            buttonData.LongDescription = $"Revit Flex Conduit 2025 v{ProductVersion}. Pick a start point and additional control points. The conduit is created and refreshed while you work, so the route stays visible. Select an existing Flex Conduit run and launch the same command to reshape it.";
             buttonData.LargeImage = LoadImage(Icon32Base64);
             buttonData.Image = LoadImage(Icon16Base64);
 
@@ -55,17 +41,19 @@ public sealed class App : IExternalApplication
             if (item != null)
                 item.AvailabilityClassName = typeof(FlexConduitAvailability).FullName;
 
-            // The supported Revit API can add a custom panel to Systems, but cannot insert an
-            // add-in button directly into Autodesk's built-in Electrical panel. Reorder our panel
-            // through Autodesk's loaded ribbon object so it sits immediately after the panel that
-            // contains Conduit Fitting(s). If this internal UI changes, the panel simply stays on Systems.
+            // Revit's supported API appends custom panels to a standard tab. Reorder the
+            // custom Flex Conduit panel immediately after the built-in Electrical panel that
+            // contains Conduit Fitting(s). The button itself cannot be inserted into Autodesk's
+            // built-in Electrical panel through the supported API.
             TryPlacePanelAfterConduitFittings(PanelName);
 
             return Result.Succeeded;
         }
         catch (Exception ex)
         {
-            TaskDialog.Show("Flex Conduit", "The ribbon control could not be created.\n\n" + ex.Message);
+            TaskDialog.Show(
+                $"Flex Conduit v{ProductVersion}",
+                "The Flex Conduit control could not be added to Revit's Systems tab.\n\n" + ex.Message);
             return Result.Failed;
         }
     }
