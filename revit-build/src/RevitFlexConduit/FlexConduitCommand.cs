@@ -4,9 +4,10 @@ using System.Linq;
 using Autodesk.Revit.Attributes;
 using Autodesk.Revit.DB;
 using Autodesk.Revit.DB.Electrical;
-using Autodesk.Revit.Exceptions;
 using Autodesk.Revit.UI;
 using Autodesk.Revit.UI.Selection;
+using RevitOperationCanceledException = Autodesk.Revit.Exceptions.OperationCanceledException;
+using RevitInvalidOperationException = Autodesk.Revit.Exceptions.InvalidOperationException;
 
 namespace RevitFlexConduit;
 
@@ -56,7 +57,7 @@ public sealed class FlexConduitCommand : IExternalCommand
             uidoc.Selection.SetElementIds(created.Select(x => x.Id).ToList());
             return Result.Succeeded;
         }
-        catch (OperationCanceledException) { return Result.Cancelled; }
+        catch (RevitOperationCanceledException) { return Result.Cancelled; }
         catch (Exception ex) { message = ex.ToString(); TaskDialog.Show("Flex Conduit", "Flex conduit could not be created.\n\n" + ex.Message); return Result.Failed; }
     }
 
@@ -75,10 +76,10 @@ public sealed class FlexConduitCommand : IExternalCommand
                     XYZ p = uidoc.Selection.PickPoint(snaps, "Flex Conduit: pick another point, or press ESC to finish");
                     if (result[^1].DistanceTo(p) >= MinSegmentFeet) result.Add(p);
                 }
-                catch (OperationCanceledException) { break; }
+                catch (RevitOperationCanceledException) { break; }
             }
         }
-        catch (InvalidOperationException ex)
+        catch (RevitInvalidOperationException ex)
         {
             TaskDialog.Show("Flex Conduit", "Set a work plane for this view, then run the tool again.\n\n" + ex.Message);
             return new List<XYZ>();
