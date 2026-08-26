@@ -1,0 +1,43 @@
+name: Build Revit Flex Conduit 2025
+
+on:
+  push:
+    branches:
+      - 'chatgpt/revit-flex-conduit-2025-*'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Restore plugin
+        run: dotnet restore revit-build/src/RevitFlexConduit/RevitFlexConduit.csproj
+
+      - name: Build plugin
+        run: dotnet build revit-build/src/RevitFlexConduit/RevitFlexConduit.csproj -c Release --no-restore
+
+      - name: Stage plugin payload
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force revit-build/src/Installer/Payload | Out-Null
+          Copy-Item revit-build/src/RevitFlexConduit/bin/Release/net8.0-windows/RevitFlexConduit.dll revit-build/src/Installer/Payload/RevitFlexConduit.dll -Force
+
+      - name: Publish single-file installer
+        run: dotnet publish revit-build/src/Installer/Installer.csproj -c Release -r win-x64 --self-contained true /p:PublishSingleFile=true /p:IncludeNativeLibrariesForSelfExtract=true /p:EnableCompressionInSingleFile=true
+
+      - name: Stage output
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item revit-build/src/Installer/bin/Release/net8.0-windows/win-x64/publish/RevitFlexConduit2025-Setup.exe dist/RevitFlexConduit2025-Setup.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RevitFlexConduit2025
+          path: dist/RevitFlexConduit2025-Setup.exe
+          if-no-files-found: error
