@@ -2,14 +2,18 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
-using System.Windows;
-using System.Windows.Controls;
 using Autodesk.Revit.Attributes;
 using Autodesk.Revit.DB;
 using Autodesk.Revit.DB.Electrical;
 using Autodesk.Revit.UI;
 using Autodesk.Revit.UI.Selection;
 using RevitOperationCanceledException = Autodesk.Revit.Exceptions.OperationCanceledException;
+using WpfButton = System.Windows.Controls.Button;
+using WpfMessageBox = System.Windows.MessageBox;
+using WpfStackPanel = System.Windows.Controls.StackPanel;
+using WpfTextBlock = System.Windows.Controls.TextBlock;
+using WpfTextBox = System.Windows.Controls.TextBox;
+using WpfWindow = System.Windows.Window;
 
 namespace RevitFlexConduit;
 
@@ -43,11 +47,9 @@ internal static class FlexV3Controller
     internal static Result CreateOrEdit(ExternalCommandData commandData, ref string message)
     {
         UIDocument uidoc = commandData.Application.ActiveUIDocument;
-        Document doc = uidoc.Document;
-
         try
         {
-            EnsureParameters(doc);
+            EnsureParameters(uidoc.Document);
             if (TryGetSelectedRecord(uidoc, out FlexV3Record selected, out _))
                 return ShowEditMenu(uidoc, selected);
             return CreateNew(uidoc);
@@ -103,7 +105,7 @@ internal static class FlexV3Controller
 
     private static void EnsureParameters(Document doc)
     {
-        if (doc.IsReadOnly) return;
+        if (doc.IsReadOnly || doc.IsFamilyDocument) return;
         using var tx = new Transaction(doc, "Flex Conduit Project Parameters");
         tx.Start();
         FlexV3ParameterService.Ensure(doc);
@@ -116,7 +118,8 @@ internal static class FlexV3Controller
         Conduit? template = uidoc.Selection.GetElementIds().Select(doc.GetElement).OfType<Conduit>().FirstOrDefault();
         FlexV3Settings settings = FlexV3Engine.CaptureSettings(doc, template, uidoc.ActiveView);
 
-        FlexEndpointPick start = PickEndpoint(uidoc, "START");
+        FlexEndpointPick? start = PickEndpoint(uidoc, "START");
+        if (start == null) return Result.Cancelled;
         if (template == null && start.Owner is Conduit startConduit)
             settings = FlexV3Engine.CaptureSettings(doc, startConduit, uidoc.ActiveView);
 
@@ -132,67 +135,75 @@ internal static class FlexV3Controller
             Points = new List<FlexPointDto> { new(start.Point) }
         };
 
-        bool createdPreview = false;
+        bool previewExists = false;
         try
         {
             while (true)
             {
                 XYZ p = uidoc.Selection.PickPoint(
                     Snaps,
-                    "Flex Conduit: click a control point. Press ESC when ready to choose the END connector/point.");
-                List<XYZ> existing = record.XyzPoints;
-                if (existing.Any(x => x.DistanceTo(p) < FlexV3Engine.MinSpacing)) continue;
+                    "Flex Conduit: click control points. The spline updates after every click. Press ESC when ready to choose the END.");
+                if (record.XyzPoints.Any(x => x.DistanceTo(p) < FlexV3Engine.MinSpacing)) continue;
                 record.Points.Add(new FlexPointDto(p));
                 if (record.Points.Count >= 2)
                 {
                     record.End = FlexConnectorBinding.Disconnected(p);
                     UpdateRun(doc, record, uidoc.ActiveView);
-                    createdPreview = true;
+                    previewExists = true;
                 }
             }
         }
         catch (RevitOperationCanceledException)
         {
-            // ESC finishes control-point placement and advances to the end connection.
+            // Normal end of intermediate control-point placement.
         }
 
+        FlexEndpointPick? end;
         try
         {
-            FlexEndpointPick end = PickEndpoint(uidoc, "END");
-            List<XYZ> points = record.XyzPoints;
-            if (points.Count == 1)
-            {
-                points.Add(end.Point);
-                points.Insert(1, FlexV3Engine.AutoMiddle(points[0], points[^1], uidoc.ActiveView));
-            }
-            else
-            {
-                if (points[^1].DistanceTo(end.Point) < FlexV3Engine.MinSpacing)
-                    points[^1] = end.Point;
-                else
-                    points.Add(end.Point);
-            }
-
-            record.Points = points.Select(x => new FlexPointDto(x)).ToList();
-            record.End = end.Binding;
-            UpdateRun(doc, record, uidoc.ActiveView);
-            FlexV3Engine.RegisterRunTriggers(doc, record);
-            SelectBody(uidoc, record.RunId);
-            return Result.Succeeded;
+            end = PickEndpoint(uidoc, "END");
         }
         catch (RevitOperationCanceledException)
         {
-            if (createdPreview) DeleteRun(doc, record.RunId);
+            if (previewExists) DeleteRun(doc, runId);
             return Result.Cancelled;
         }
+
+        if (end == null)
+        {
+            if (previewExists) DeleteRun(doc, runId);
+            return Result.Cancelled;
+        }
+
+        List<XYZ> points = record.XyzPoints;
+        if (points.Count == 1)
+        {
+            points.Add(end.Point);
+            points.Insert(1, FlexV3Engine.AutoMiddle(points[0], points[^1], uidoc.ActiveView));
+        }
+        else if (points[^1].DistanceTo(end.Point) < FlexV3Engine.MinSpacing)
+        {
+            points[^1] = end.Point;
+        }
+        else
+        {
+            points.Add(end.Point);
+        }
+
+        record.Points = points.Select(x => new FlexPointDto(x)).ToList();
+        record.End = end.Binding;
+        UpdateRun(doc, record, uidoc.ActiveView);
+        FlexV3Engine.RegisterRunTriggers(doc, record);
+        SelectBody(uidoc, runId);
+        return Result.Succeeded;
     }
 
-    private static FlexEndpointPick PickEndpoint(UIDocument uidoc, string which)
+    private static FlexEndpointPick? PickEndpoint(UIDocument uidoc, string which)
     {
         var td = new TaskDialog($"Flex Conduit — {which}")
         {
             MainInstruction = $"Choose the {which.ToLowerInvariant()} of the Flex Conduit",
-            MainContent = "A connector keeps a persistent relationship to the equipment/conduit endpoint. A point remains free in model space.",
+            MainContent = "Connector mode keeps a persistent relationship to equipment or a conduit endpoint. Free point mode remains an independent XYZ endpoint.",
             CommonButtons = TaskDialogCommonButtons.Cancel,
             DefaultButton = TaskDialogResult.CommandLink1
         };
@@ -207,11 +218,11 @@ internal static class FlexV3Controller
                 new FlexConnectorOwnerFilter(),
                 $"Flex Conduit: select equipment, fitting, or conduit containing the {which} connector");
             Element owner = uidoc.Document.GetElement(reference.ElementId);
-            XYZ near;
-            try { near = reference.GlobalPoint; }
-            catch { near = owner.get_BoundingBox(null)?.Min ?? XYZ.Zero; }
+            XYZ near = GetReferencePoint(reference, owner);
             Connector? connector = FlexConnectorUtil.FindNearest(owner, near);
-            if (connector == null) throw new InvalidOperationException("The selected element does not expose an MEP connector.");
+            if (connector == null)
+                throw new InvalidOperationException("The selected element does not expose an MEP connector.");
+
             return new FlexEndpointPick
             {
                 Point = connector.Origin,
@@ -226,7 +237,20 @@ internal static class FlexV3Controller
             return new FlexEndpointPick { Point = p, Binding = FlexConnectorBinding.Disconnected(p) };
         }
 
-        throw new RevitOperationCanceledException();
+        return null;
+    }
+
+    private static XYZ GetReferencePoint(Reference reference, Element owner)
+    {
+        try
+        {
+            XYZ? p = reference.GlobalPoint;
+            if (p != null) return p;
+        }
+        catch { }
+
+        BoundingBoxXYZ? box = owner.get_BoundingBox(null);
+        return box == null ? XYZ.Zero : (box.Min + box.Max).Multiply(0.5);
     }
 
     private static Result ShowEditMenu(UIDocument uidoc, FlexV3Record record)
@@ -237,10 +261,10 @@ internal static class FlexV3Controller
             MainContent = $"Run {record.RunId} • {record.XyzPoints.Count} control points • length {FormatLength(record.SplineLength)}",
             CommonButtons = TaskDialogCommonButtons.Cancel
         };
-        td.AddCommandLink(TaskDialogCommandLinkId.CommandLink1, "Edit Path", "Move any persistent XYZ control point.");
+        td.AddCommandLink(TaskDialogCommandLinkId.CommandLink1, "Edit Path", "Move persistent XYZ control points.");
         td.AddCommandLink(TaskDialogCommandLinkId.CommandLink2, "Add Control Point");
         td.AddCommandLink(TaskDialogCommandLinkId.CommandLink3, "Delete Control Point");
-        td.AddCommandLink(TaskDialogCommandLinkId.CommandLink4, "More tools", "Smooth, reverse, reconnect, diameter, convert.");
+        td.AddCommandLink(TaskDialogCommandLinkId.CommandLink4, "More tools", "Smooth, reverse, reconnect, diameter, or convert.");
         TaskDialogResult result = td.Show();
 
         if (result == TaskDialogResult.CommandLink1) return EditPath(uidoc, record);
@@ -260,20 +284,24 @@ internal static class FlexV3Controller
         td.AddCommandLink(TaskDialogCommandLinkId.CommandLink1, "Reset / Smooth Route", "Keep endpoints and rebuild a clean smooth route.");
         td.AddCommandLink(TaskDialogCommandLinkId.CommandLink2, "Reverse Direction");
         td.AddCommandLink(TaskDialogCommandLinkId.CommandLink3, "Reconnect Endpoints");
-        td.AddCommandLink(TaskDialogCommandLinkId.CommandLink4, "More", "Diameter or Convert to Conduit.");
+        td.AddCommandLink(TaskDialogCommandLinkId.CommandLink4, "Geometry / Convert", "Change diameter or convert to native conduit.");
         TaskDialogResult result = td.Show();
+
         if (result == TaskDialogResult.CommandLink1) return Smooth(uidoc, record);
         if (result == TaskDialogResult.CommandLink2) return Reverse(uidoc, record);
         if (result == TaskDialogResult.CommandLink3) return Reconnect(uidoc, record);
-        if (result == TaskDialogResult.CommandLink4)
+        if (result != TaskDialogResult.CommandLink4) return Result.Cancelled;
+
+        var more = new TaskDialog("Flex Conduit")
         {
-            var more = new TaskDialog("Flex Conduit") { MainInstruction = "Geometry / conversion", CommonButtons = TaskDialogCommonButtons.Cancel };
-            more.AddCommandLink(TaskDialogCommandLinkId.CommandLink1, "Change Diameter");
-            more.AddCommandLink(TaskDialogCommandLinkId.CommandLink2, "Convert to native Conduit", "Approximate the spline with connected native conduit segments.");
-            TaskDialogResult m = more.Show();
-            if (m == TaskDialogResult.CommandLink1) return SetDiameter(uidoc, record);
-            if (m == TaskDialogResult.CommandLink2) return ConvertToConduit(uidoc, record);
-        }
+            MainInstruction = "Geometry / conversion",
+            CommonButtons = TaskDialogCommonButtons.Cancel
+        };
+        more.AddCommandLink(TaskDialogCommandLinkId.CommandLink1, "Change Diameter");
+        more.AddCommandLink(TaskDialogCommandLinkId.CommandLink2, "Convert to native Conduit", "Approximates the spline with connected native conduit segments.");
+        TaskDialogResult m = more.Show();
+        if (m == TaskDialogResult.CommandLink1) return SetDiameter(uidoc, record);
+        if (m == TaskDialogResult.CommandLink2) return ConvertToConduit(uidoc, record);
         return Result.Cancelled;
     }
 
@@ -283,18 +311,21 @@ internal static class FlexV3Controller
         while (true)
         {
             List<DirectShape> markers = FlexV3Data.FindMarkers(doc, record.RunId);
+            if (markers.Count == 0) return Result.Cancelled;
+
             try
             {
                 Reference picked = uidoc.Selection.PickObject(
                     ObjectType.Element,
                     new IdFilter(markers.Select(m => m.Id)),
-                    "Flex Conduit: select a control point to move, or ESC to finish");
+                    "Flex Conduit: select a control point to move, or press ESC to finish");
                 DirectShape marker = (DirectShape)doc.GetElement(picked.ElementId);
                 if (!FlexV3Data.TryRead(marker, out FlexV3Record markerRecord)) continue;
                 int index = markerRecord.MarkerIndex;
-                XYZ newPoint = uidoc.Selection.PickPoint(Snaps, $"Move control point {index + 1} to new XYZ position");
                 List<XYZ> pts = record.XyzPoints;
                 if (index < 0 || index >= pts.Count) continue;
+
+                XYZ newPoint = uidoc.Selection.PickPoint(Snaps, $"Move control point {index + 1} to new XYZ position");
                 pts[index] = newPoint;
                 record.Points = pts.Select(x => new FlexPointDto(x)).ToList();
                 if (index == 0) record.Start = FlexConnectorBinding.Disconnected(newPoint);
@@ -314,13 +345,10 @@ internal static class FlexV3Controller
     {
         XYZ p = uidoc.Selection.PickPoint(Snaps, "Flex Conduit: pick the new control point location");
         List<XYZ> points = record.XyzPoints;
-        int index = FlexV3Engine.FindInsertionIndex(points, p);
-        index = Math.Clamp(index, 1, points.Count - 1);
+        int index = Math.Clamp(FlexV3Engine.FindInsertionIndex(points, p), 1, points.Count - 1);
         points.Insert(index, p);
         record.Points = points.Select(x => new FlexPointDto(x)).ToList();
-        UpdateRun(uidoc.Document, record, uidoc.ActiveView);
-        FlexV3Engine.RegisterRunTriggers(uidoc.Document, record);
-        SelectBody(uidoc, record.RunId);
+        SaveAndReselect(uidoc, record);
         return Result.Succeeded;
     }
 
@@ -333,6 +361,7 @@ internal static class FlexV3Controller
             "Flex Conduit: select an INTERIOR control point to delete");
         DirectShape marker = (DirectShape)uidoc.Document.GetElement(picked.ElementId);
         if (!FlexV3Data.TryRead(marker, out FlexV3Record markerRecord)) return Result.Cancelled;
+
         int index = markerRecord.MarkerIndex;
         List<XYZ> points = record.XyzPoints;
         if (index <= 0 || index >= points.Count - 1)
@@ -340,19 +369,19 @@ internal static class FlexV3Controller
             TaskDialog.Show("Flex Conduit", "Start and end control points cannot be deleted. Use Reconnect or Edit Path instead.");
             return Result.Cancelled;
         }
+
         points.RemoveAt(index);
         if (points.Count == 2)
             points.Insert(1, FlexV3Engine.AutoMiddle(points[0], points[1], uidoc.ActiveView));
         record.Points = points.Select(x => new FlexPointDto(x)).ToList();
-        UpdateRun(uidoc.Document, record, uidoc.ActiveView);
-        FlexV3Engine.RegisterRunTriggers(uidoc.Document, record);
-        SelectBody(uidoc, record.RunId);
+        SaveAndReselect(uidoc, record);
         return Result.Succeeded;
     }
 
     private static Result Smooth(UIDocument uidoc, FlexV3Record record)
     {
         List<XYZ> points = record.XyzPoints;
+        if (points.Count < 2) return Result.Cancelled;
         XYZ start = points[0];
         XYZ end = points[^1];
         record.Points = new List<FlexPointDto>
@@ -361,9 +390,7 @@ internal static class FlexV3Controller
             new(FlexV3Engine.AutoMiddle(start, end, uidoc.ActiveView)),
             new(end)
         };
-        UpdateRun(uidoc.Document, record, uidoc.ActiveView);
-        FlexV3Engine.RegisterRunTriggers(uidoc.Document, record);
-        SelectBody(uidoc, record.RunId);
+        SaveAndReselect(uidoc, record);
         return Result.Succeeded;
     }
 
@@ -373,9 +400,7 @@ internal static class FlexV3Controller
         points.Reverse();
         record.Points = points.Select(x => new FlexPointDto(x)).ToList();
         (record.Start, record.End) = (record.End, record.Start);
-        UpdateRun(uidoc.Document, record, uidoc.ActiveView);
-        FlexV3Engine.RegisterRunTriggers(uidoc.Document, record);
-        SelectBody(uidoc, record.RunId);
+        SaveAndReselect(uidoc, record);
         return Result.Succeeded;
     }
 
@@ -390,8 +415,9 @@ internal static class FlexV3Controller
         td.AddCommandLink(TaskDialogCommandLinkId.CommandLink2, "Reconnect END");
         td.AddCommandLink(TaskDialogCommandLinkId.CommandLink3, "Reconnect BOTH");
         TaskDialogResult result = td.Show();
-        List<XYZ> points = record.XyzPoints;
+        if (result == TaskDialogResult.Cancel) return Result.Cancelled;
 
+        List<XYZ> points = record.XyzPoints;
         if (result is TaskDialogResult.CommandLink1 or TaskDialogResult.CommandLink3)
         {
             FlexEndpointPick start = PickConnectorOnly(uidoc, "START");
@@ -404,12 +430,9 @@ internal static class FlexV3Controller
             points[^1] = end.Point;
             record.End = end.Binding;
         }
-        if (result == TaskDialogResult.Cancel) return Result.Cancelled;
 
         record.Points = points.Select(x => new FlexPointDto(x)).ToList();
-        UpdateRun(uidoc.Document, record, uidoc.ActiveView);
-        FlexV3Engine.RegisterRunTriggers(uidoc.Document, record);
-        SelectBody(uidoc, record.RunId);
+        SaveAndReselect(uidoc, record);
         return Result.Succeeded;
     }
 
@@ -420,22 +443,22 @@ internal static class FlexV3Controller
             new FlexConnectorOwnerFilter(),
             $"Flex Conduit: select the element containing the new {which} connector");
         Element owner = uidoc.Document.GetElement(reference.ElementId);
-        XYZ near;
-        try { near = reference.GlobalPoint; } catch { near = owner.get_BoundingBox(null)?.Min ?? XYZ.Zero; }
-        Connector? connector = FlexConnectorUtil.FindNearest(owner, near);
+        Connector? connector = FlexConnectorUtil.FindNearest(owner, GetReferencePoint(reference, owner));
         if (connector == null) throw new InvalidOperationException("No valid connector found.");
-        return new FlexEndpointPick { Point = connector.Origin, Binding = FlexConnectorUtil.CreateBinding(owner, connector), Owner = owner };
+        return new FlexEndpointPick
+        {
+            Point = connector.Origin,
+            Binding = FlexConnectorUtil.CreateBinding(owner, connector),
+            Owner = owner
+        };
     }
 
     private static Result SetDiameter(UIDocument uidoc, FlexV3Record record)
     {
         var window = new FlexDiameterWindow(record.Settings.Diameter * 12.0);
-        bool? result = window.ShowDialog();
-        if (result != true) return Result.Cancelled;
+        if (window.ShowDialog() != true) return Result.Cancelled;
         record.Settings.Diameter = window.DiameterInches / 12.0;
-        UpdateRun(uidoc.Document, record, uidoc.ActiveView);
-        FlexV3Engine.RegisterRunTriggers(uidoc.Document, record);
-        SelectBody(uidoc, record.RunId);
+        SaveAndReselect(uidoc, record);
         return Result.Succeeded;
     }
 
@@ -443,8 +466,7 @@ internal static class FlexV3Controller
     {
         Document doc = uidoc.Document;
         HermiteSpline spline = FlexV3Engine.BuildSpline(record, uidoc.ActiveView);
-        IList<XYZ> raw = spline.Tessellate();
-        List<XYZ> points = SimplifyTessellation(raw, 0.35);
+        List<XYZ> points = SimplifyTessellation(spline.Tessellate(), 0.35);
         if (points.Count < 2) return Result.Cancelled;
 
         ElementId typeId = record.Settings.TypeId >= 0 ? new ElementId(record.Settings.TypeId) : ElementId.InvalidElementId;
@@ -466,10 +488,12 @@ internal static class FlexV3Controller
         }
         doc.Regenerate();
         ConnectNativeRun(conduits, record, doc);
+
         foreach (DirectShape marker in FlexV3Data.FindMarkers(doc, record.RunId)) doc.Delete(marker.Id);
         DirectShape? body = FlexV3Data.FindBody(doc, record.RunId);
         if (body != null) doc.Delete(body.Id);
         tx.Commit();
+
         uidoc.Selection.SetElementIds(conduits.Select(c => c.Id).ToList());
         return Result.Succeeded;
     }
@@ -479,8 +503,8 @@ internal static class FlexV3Controller
         var result = new List<XYZ>();
         if (raw.Count == 0) return result;
         result.Add(raw[0]);
-        foreach (XYZ p in raw.Skip(1).Take(Math.Max(0, raw.Count - 2)))
-            if (result[^1].DistanceTo(p) >= targetFeet) result.Add(p);
+        for (int i = 1; i < raw.Count - 1; i++)
+            if (result[^1].DistanceTo(raw[i]) >= targetFeet) result.Add(raw[i]);
         if (result[^1].DistanceTo(raw[^1]) > 1e-6) result.Add(raw[^1]);
         return result;
     }
@@ -510,6 +534,13 @@ internal static class FlexV3Controller
 
     private static Connector? Closest(Conduit conduit, XYZ point)
         => conduit.ConnectorManager.Connectors.Cast<Connector>().OrderBy(c => c.Origin.DistanceTo(point)).FirstOrDefault();
+
+    private static void SaveAndReselect(UIDocument uidoc, FlexV3Record record)
+    {
+        UpdateRun(uidoc.Document, record, uidoc.ActiveView);
+        FlexV3Engine.RegisterRunTriggers(uidoc.Document, record);
+        SelectBody(uidoc, record.RunId);
+    }
 
     private static void UpdateRun(Document doc, FlexV3Record record, View view)
     {
@@ -543,6 +574,7 @@ internal static class FlexV3Controller
                 record = candidate;
                 return true;
             }
+
             DirectShape? body = FlexV3Data.FindBody(uidoc.Document, candidate.RunId);
             if (body != null && FlexV3Data.TryRead(body, out FlexV3Record bodyRecord))
             {
@@ -575,9 +607,9 @@ internal static class FlexV3Controller
     }
 }
 
-internal sealed class FlexDiameterWindow : Window
+internal sealed class FlexDiameterWindow : WpfWindow
 {
-    private readonly TextBox _text = new();
+    private readonly WpfTextBox _text = new();
     internal double DiameterInches { get; private set; }
 
     internal FlexDiameterWindow(double currentInches)
@@ -585,23 +617,39 @@ internal sealed class FlexDiameterWindow : Window
         Title = "Flex Conduit Diameter";
         Width = 330;
         Height = 180;
-        ResizeMode = ResizeMode.NoResize;
-        WindowStartupLocation = WindowStartupLocation.CenterScreen;
+        ResizeMode = System.Windows.ResizeMode.NoResize;
+        WindowStartupLocation = System.Windows.WindowStartupLocation.CenterScreen;
 
-        var panel = new StackPanel { Margin = new Thickness(18) };
-        panel.Children.Add(new TextBlock { Text = "Diameter / trade size (inches)", Margin = new Thickness(0, 0, 0, 6) });
+        var panel = new WpfStackPanel { Margin = new System.Windows.Thickness(18) };
+        panel.Children.Add(new WpfTextBlock
+        {
+            Text = "Diameter / trade size (inches)",
+            Margin = new System.Windows.Thickness(0, 0, 0, 6)
+        });
         _text.Text = currentInches.ToString("0.###", CultureInfo.InvariantCulture);
         _text.MinHeight = 28;
         panel.Children.Add(_text);
 
-        var buttons = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right, Margin = new Thickness(0, 18, 0, 0) };
-        var ok = new Button { Content = "OK", Width = 80, Height = 30, IsDefault = true, Margin = new Thickness(0, 0, 8, 0) };
-        var cancel = new Button { Content = "Cancel", Width = 80, Height = 30, IsCancel = true };
+        var buttons = new WpfStackPanel
+        {
+            Orientation = System.Windows.Controls.Orientation.Horizontal,
+            HorizontalAlignment = System.Windows.HorizontalAlignment.Right,
+            Margin = new System.Windows.Thickness(0, 18, 0, 0)
+        };
+        var ok = new WpfButton
+        {
+            Content = "OK",
+            Width = 80,
+            Height = 30,
+            IsDefault = true,
+            Margin = new System.Windows.Thickness(0, 0, 8, 0)
+        };
+        var cancel = new WpfButton { Content = "Cancel", Width = 80, Height = 30, IsCancel = true };
         ok.Click += (_, _) =>
         {
             if (!double.TryParse(_text.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out double value) || value <= 0)
             {
-                MessageBox.Show(this, "Enter a positive diameter in inches.", "Flex Conduit");
+                WpfMessageBox.Show(this, "Enter a positive diameter in inches.", "Flex Conduit");
                 return;
             }
             DiameterInches = value;
@@ -621,14 +669,53 @@ public sealed class FlexConduitV3Command : IExternalCommand
         => FlexV3Controller.CreateOrEdit(commandData, ref message);
 }
 
-[Transaction(TransactionMode.Manual)] public sealed class FlexEditPathCommand : IExternalCommand { public Result Execute(ExternalCommandData d, ref string m, ElementSet e) => FlexV3Controller.RunTool(d, FlexV3Tool.EditPath, ref m); }
-[Transaction(TransactionMode.Manual)] public sealed class FlexAddPointCommand : IExternalCommand { public Result Execute(ExternalCommandData d, ref string m, ElementSet e) => FlexV3Controller.RunTool(d, FlexV3Tool.AddPoint, ref m); }
-[Transaction(TransactionMode.Manual)] public sealed class FlexDeletePointCommand : IExternalCommand { public Result Execute(ExternalCommandData d, ref string m, ElementSet e) => FlexV3Controller.RunTool(d, FlexV3Tool.DeletePoint, ref m); }
-[Transaction(TransactionMode.Manual)] public sealed class FlexSmoothCommand : IExternalCommand { public Result Execute(ExternalCommandData d, ref string m, ElementSet e) => FlexV3Controller.RunTool(d, FlexV3Tool.Smooth, ref m); }
-[Transaction(TransactionMode.Manual)] public sealed class FlexReverseCommand : IExternalCommand { public Result Execute(ExternalCommandData d, ref string m, ElementSet e) => FlexV3Controller.RunTool(d, FlexV3Tool.Reverse, ref m); }
-[Transaction(TransactionMode.Manual)] public sealed class FlexReconnectCommand : IExternalCommand { public Result Execute(ExternalCommandData d, ref string m, ElementSet e) => FlexV3Controller.RunTool(d, FlexV3Tool.Reconnect, ref m); }
-[Transaction(TransactionMode.Manual)] public sealed class FlexDiameterCommand : IExternalCommand { public Result Execute(ExternalCommandData d, ref string m, ElementSet e) => FlexV3Controller.RunTool(d, FlexV3Tool.SetDiameter, ref m); }
-[Transaction(TransactionMode.Manual)] public sealed class FlexConvertCommand : IExternalCommand { public Result Execute(ExternalCommandData d, ref string m, ElementSet e) => FlexV3Controller.RunTool(d, FlexV3Tool.ConvertToConduit, ref m); }
+[Transaction(TransactionMode.Manual)]
+public sealed class FlexEditPathCommand : IExternalCommand
+{
+    public Result Execute(ExternalCommandData d, ref string m, ElementSet e) => FlexV3Controller.RunTool(d, FlexV3Tool.EditPath, ref m);
+}
+
+[Transaction(TransactionMode.Manual)]
+public sealed class FlexAddPointCommand : IExternalCommand
+{
+    public Result Execute(ExternalCommandData d, ref string m, ElementSet e) => FlexV3Controller.RunTool(d, FlexV3Tool.AddPoint, ref m);
+}
+
+[Transaction(TransactionMode.Manual)]
+public sealed class FlexDeletePointCommand : IExternalCommand
+{
+    public Result Execute(ExternalCommandData d, ref string m, ElementSet e) => FlexV3Controller.RunTool(d, FlexV3Tool.DeletePoint, ref m);
+}
+
+[Transaction(TransactionMode.Manual)]
+public sealed class FlexSmoothCommand : IExternalCommand
+{
+    public Result Execute(ExternalCommandData d, ref string m, ElementSet e) => FlexV3Controller.RunTool(d, FlexV3Tool.Smooth, ref m);
+}
+
+[Transaction(TransactionMode.Manual)]
+public sealed class FlexReverseCommand : IExternalCommand
+{
+    public Result Execute(ExternalCommandData d, ref string m, ElementSet e) => FlexV3Controller.RunTool(d, FlexV3Tool.Reverse, ref m);
+}
+
+[Transaction(TransactionMode.Manual)]
+public sealed class FlexReconnectCommand : IExternalCommand
+{
+    public Result Execute(ExternalCommandData d, ref string m, ElementSet e) => FlexV3Controller.RunTool(d, FlexV3Tool.Reconnect, ref m);
+}
+
+[Transaction(TransactionMode.Manual)]
+public sealed class FlexDiameterCommand : IExternalCommand
+{
+    public Result Execute(ExternalCommandData d, ref string m, ElementSet e) => FlexV3Controller.RunTool(d, FlexV3Tool.SetDiameter, ref m);
+}
+
+[Transaction(TransactionMode.Manual)]
+public sealed class FlexConvertCommand : IExternalCommand
+{
+    public Result Execute(ExternalCommandData d, ref string m, ElementSet e) => FlexV3Controller.RunTool(d, FlexV3Tool.ConvertToConduit, ref m);
+}
 
 public sealed class FlexV3Availability : IExternalCommandAvailability
 {
