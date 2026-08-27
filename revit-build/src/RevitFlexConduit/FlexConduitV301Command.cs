@@ -11,14 +11,18 @@ using RevitOperationCanceledException = Autodesk.Revit.Exceptions.OperationCance
 namespace RevitFlexConduit;
 
 /// <summary>
-/// v3.0.1 creation entry point. Revit 2025 throws an ArgumentException when a
-/// TaskDialog DefaultButton is assigned to a command link before that link has
-/// been registered. This command uses the same v3 data/geometry/updater engine
-/// but deliberately leaves command-link dialogs without a DefaultButton.
+/// Native-style Flex Conduit creation entry point.
+/// START and END are selected with one normal Revit point pick: when the picked
+/// XYZ coincides with an open conduit/MEP connector the endpoint binds to that
+/// connector; otherwise the exact picked XYZ is stored as a free endpoint.
+/// No endpoint-mode TaskDialog is shown.
 /// </summary>
 [Transaction(TransactionMode.Manual)]
 public sealed class FlexConduitV301Command : IExternalCommand
 {
+    private const double ConnectorHitTolerance = 0.012; // ft, ~ 1/8 in
+    private const double ConnectorSearchRadius = 0.15;  // ft, bounding-box search only
+
     private static ObjectSnapTypes Snaps => ObjectSnapTypes.Endpoints |
                                                   ObjectSnapTypes.Midpoints |
                                                   ObjectSnapTypes.Intersections |
@@ -30,8 +34,6 @@ public sealed class FlexConduitV301Command : IExternalCommand
         UIDocument uidoc = commandData.Application.ActiveUIDocument;
         try
         {
-            // Existing runs can continue to use the v3 edit controller; its edit dialogs
-            // do not assign an invalid DefaultButton.
             if (FlexV3Controller.TryGetSelectedRecord(uidoc, out _, out _))
                 return FlexV3Controller.CreateOrEdit(commandData, ref message);
 
@@ -45,7 +47,7 @@ public sealed class FlexConduitV301Command : IExternalCommand
         catch (Exception ex)
         {
             message = ex.ToString();
-            TaskDialog.Show("Flex Conduit v3.0.1", "Flex Conduit could not complete the operation.\n\n" + ex.Message);
+            TaskDialog.Show($"Flex Conduit v{App301.ProductVersion}", "Flex Conduit could not complete the operation.\n\n" + ex.Message);
             return Result.Failed;
         }
     }
@@ -65,8 +67,7 @@ public sealed class FlexConduitV301Command : IExternalCommand
         Conduit? template = uidoc.Selection.GetElementIds().Select(doc.GetElement).OfType<Conduit>().FirstOrDefault();
         FlexV3Settings settings = FlexV3Engine.CaptureSettings(doc, template, uidoc.ActiveView);
 
-        FlexEndpointPick? start = PickEndpoint(uidoc, "START");
-        if (start == null) return Result.Cancelled;
+        FlexEndpointPick start = PickEndpoint(uidoc, "START");
         if (template == null && start.Owner is Conduit startConduit)
             settings = FlexV3Engine.CaptureSettings(doc, startConduit, uidoc.ActiveView);
 
@@ -89,7 +90,7 @@ public sealed class FlexConduitV301Command : IExternalCommand
             {
                 XYZ p = uidoc.Selection.PickPoint(
                     Snaps,
-                    "Flex Conduit: click control points. The spline updates after every click. Press ESC when ready to choose the END.");
+                    "Flex Conduit: click control points. The spline updates after each click. Press ESC when ready to place END.");
 
                 if (record.XyzPoints.Any(x => x.DistanceTo(p) < FlexV3Engine.MinSpacing))
                     continue;
@@ -105,11 +106,15 @@ public sealed class FlexConduitV301Command : IExternalCommand
         }
         catch (RevitOperationCanceledException)
         {
-            // ESC finishes intermediate point placement and moves to END selection.
+            // ESC completes intermediate control-point placement.
         }
 
-        FlexEndpointPick? end = PickEndpoint(uidoc, "END");
-        if (end == null)
+        FlexEndpointPick end;
+        try
+        {
+            end = PickEndpoint(uidoc, "END");
+        }
+        catch (RevitOperationCanceledException)
         {
             if (previewExists) DeleteRun(doc, runId);
             return Result.Cancelled;
@@ -138,33 +143,14 @@ public sealed class FlexConduitV301Command : IExternalCommand
         return Result.Succeeded;
     }
 
-    private static FlexEndpointPick? PickEndpoint(UIDocument uidoc, string which)
+    private static FlexEndpointPick PickEndpoint(UIDocument uidoc, string which)
     {
-        var td = new TaskDialog($"Flex Conduit — {which}")
+        XYZ picked = uidoc.Selection.PickPoint(
+            Snaps,
+            $"Flex Conduit: click {which}. Snap to an open conduit/electrical connector to connect; click empty space for a free endpoint.");
+
+        if (TryResolveConnectorAtPoint(uidoc, picked, out Element? owner, out Connector? connector) && owner != null && connector != null)
         {
-            MainInstruction = $"Choose the {which.ToLowerInvariant()} of the Flex Conduit",
-            MainContent = "Connector mode keeps a persistent relationship to equipment or a conduit endpoint. Free point mode remains an independent XYZ endpoint.",
-            CommonButtons = TaskDialogCommonButtons.Cancel
-        };
-
-        // Important: no DefaultButton assignment here. Revit 2025 validates the button
-        // immediately and throws if the referenced command link has not yet been registered.
-        td.AddCommandLink(TaskDialogCommandLinkId.CommandLink1, "Electrical connector / conduit endpoint");
-        td.AddCommandLink(TaskDialogCommandLinkId.CommandLink2, "Arbitrary XYZ point");
-
-        TaskDialogResult result = td.Show();
-        if (result == TaskDialogResult.CommandLink1)
-        {
-            Reference reference = uidoc.Selection.PickObject(
-                ObjectType.Element,
-                new FlexConnectorOwnerFilter(),
-                $"Flex Conduit: select equipment, fitting, or conduit containing the {which} connector");
-            Element owner = uidoc.Document.GetElement(reference.ElementId);
-            XYZ near = GetReferencePoint(reference, owner);
-            Connector? connector = FlexConnectorUtil.FindNearest(owner, near);
-            if (connector == null)
-                throw new InvalidOperationException("The selected element does not expose an MEP connector.");
-
             return new FlexEndpointPick
             {
                 Point = connector.Origin,
@@ -173,30 +159,83 @@ public sealed class FlexConduitV301Command : IExternalCommand
             };
         }
 
-        if (result == TaskDialogResult.CommandLink2)
+        return new FlexEndpointPick
         {
-            XYZ p = uidoc.Selection.PickPoint(Snaps, $"Flex Conduit: pick {which} point");
-            return new FlexEndpointPick
-            {
-                Point = p,
-                Binding = FlexConnectorBinding.Disconnected(p)
-            };
-        }
-
-        return null;
+            Point = picked,
+            Binding = FlexConnectorBinding.Disconnected(picked)
+        };
     }
 
-    private static XYZ GetReferencePoint(Reference reference, Element owner)
+    private static bool TryResolveConnectorAtPoint(UIDocument uidoc, XYZ picked, out Element? owner, out Connector? connector)
+    {
+        owner = null;
+        connector = null;
+
+        List<ConnectorHit> hits = new();
+        foreach (Element element in FindNearbyElements(uidoc, picked))
+        {
+            foreach (Connector candidate in FlexConnectorUtil.GetConnectors(element))
+            {
+                double distance;
+                try { distance = candidate.Origin.DistanceTo(picked); }
+                catch { continue; }
+
+                if (distance > ConnectorHitTolerance) continue;
+                if (!IsOpenConnector(candidate)) continue;
+
+                int priority = element is Conduit ? 0 :
+                    element.Category?.Id.Value == (long)BuiltInCategory.OST_ConduitFitting ? 1 : 2;
+                hits.Add(new ConnectorHit(element, candidate, distance, priority));
+            }
+        }
+
+        ConnectorHit? best = hits
+            .OrderBy(h => h.Priority)
+            .ThenBy(h => h.Distance)
+            .FirstOrDefault();
+
+        if (best == null) return false;
+        owner = best.Owner;
+        connector = best.Connector;
+        return true;
+    }
+
+    private static IEnumerable<Element> FindNearbyElements(UIDocument uidoc, XYZ picked)
+    {
+        Document doc = uidoc.Document;
+        XYZ delta = new(ConnectorSearchRadius, ConnectorSearchRadius, ConnectorSearchRadius);
+        var outline = new Outline(picked - delta, picked + delta);
+        var bbox = new BoundingBoxIntersectsFilter(outline);
+
+        try
+        {
+            return new FilteredElementCollector(doc, uidoc.ActiveView.Id)
+                .WhereElementIsNotElementType()
+                .WherePasses(bbox)
+                .ToElements();
+        }
+        catch
+        {
+            return new FilteredElementCollector(doc)
+                .WhereElementIsNotElementType()
+                .WherePasses(bbox)
+                .ToElements();
+        }
+    }
+
+    private static bool IsOpenConnector(Connector connector)
     {
         try
         {
-            XYZ? p = reference.GlobalPoint;
-            if (p != null) return p;
+            if (connector.IsConnected) return false;
+            return connector.ConnectorType == ConnectorType.End ||
+                   connector.ConnectorType == ConnectorType.Physical ||
+                   connector.ConnectorType == ConnectorType.Curve;
         }
-        catch { }
-
-        BoundingBoxXYZ? box = owner.get_BoundingBox(null);
-        return box == null ? XYZ.Zero : (box.Min + box.Max).Multiply(0.5);
+        catch
+        {
+            return false;
+        }
     }
 
     private static void UpdateRun(Document doc, FlexV3Record record, View view)
@@ -224,4 +263,6 @@ public sealed class FlexConduitV301Command : IExternalCommand
         if (body != null)
             uidoc.Selection.SetElementIds(new[] { body.Id });
     }
+
+    private sealed record ConnectorHit(Element Owner, Connector Connector, double Distance, int Priority);
 }
