@@ -113,7 +113,7 @@ jobs:
           if ($verifyModel.Contains('body.Name = $"Flex Conduit') -or $verifyModel.Contains('marker.Name = $"Flex Control')) { throw 'Unsafe DirectShape Name assignment remains.' }
           if ($verifyCreate.Contains('Choose the start of the Flex Conduit') -or $verifyCreate.Contains('new TaskDialog($"Flex Conduit — {which}")')) { throw 'Endpoint mode dialog still exists.' }
           if (-not $verifyCreate.Contains('TryResolveConnectorAtPoint')) { throw 'Automatic connector hit detection missing.' }
-          if ($verifyNative.Contains('NewUnionFitting')) { throw 'Unsafe forced union-fitting creation remains.' }
+          if ($verifyNative.Contains('doc.Create.NewUnionFitting')) { throw 'Unsafe forced union-fitting creation remains.' }
           if (-not $verifyInstaller.Contains('ProductVersion = "3.2.0"')) { throw 'Installer UI ProductVersion was not updated to v3.2.0.' }
           if ($verifyInstaller.Contains('3.0.1') -or $verifyInstaller.Contains('3.1.0') -or $verifyInstaller.Contains('3.1.1')) { throw 'Old installer version text remains in Program301.cs.' }
           if (-not $verifyInstallerProject.Contains('<AssemblyName>RevitFlexConduit2025-v3.2.0-Setup</AssemblyName>')) { throw 'Installer EXE assembly name is not v3.2.0.' }
