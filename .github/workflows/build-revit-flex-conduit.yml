@@ -1,4 +1,4 @@
-name: Build Revit Flex Conduit 2025 v3.1.1
+name: Build Revit Flex Conduit 2025 v3.2.0
 
 on:
   push:
@@ -16,7 +16,7 @@ jobs:
         with:
           dotnet-version: '8.0.x'
 
-      - name: Apply v3.1.1 Revit integration patches
+      - name: Apply v3.2.0 Revit integration patches
         shell: pwsh
         run: |
           $utf8 = New-Object System.Text.UTF8Encoding($false)
@@ -39,9 +39,19 @@ jobs:
           $model = $model.Replace('        FlexV3ParameterService.Apply(body, record);', '        FlexV3ParameterService.Apply(body, record);' + [Environment]::NewLine + '        FlexNativeEndpointService.SyncGraphics(doc, body, record);')
           [IO.File]::WriteAllText($modelPath, $model, $utf8)
 
-          # Native anchor movement is a regeneration trigger.
+          # Expose updater context to the native endpoint service. MEP topology changes
+          # are suppressed while the updater executes, preventing fitting-space failures.
           $updaterPath = 'revit-build/src/RevitFlexConduit/FlexConduitV3Updater.cs'
           $updater = [IO.File]::ReadAllText($updaterPath)
+          if (-not $updater.Contains('internal static bool IsExecuting => _executing;')) {
+            $needleFlag = '    private static bool _executing;'
+            $replacementFlag = '    private static bool _executing;' + [Environment]::NewLine + '    internal static bool IsExecuting => _executing;'
+            if (-not $updater.Contains($needleFlag)) { throw 'Could not expose updater execution state.' }
+            $updater = $updater.Replace($needleFlag, $replacementFlag)
+          }
+
+          # Native anchor movement is a regeneration trigger. Regenerate now performs
+          # a read-only anchor sync while inside IUpdater.
           $needle = '                if (!FlexV3Data.TryRead(element, out FlexV3Record elementRecord)) continue;' + [Environment]::NewLine + [Environment]::NewLine + '                if (elementRecord.Kind == "Marker")'
           if (-not $updater.Contains($needle)) {
             $needle = '                if (!FlexV3Data.TryRead(element, out FlexV3Record elementRecord)) continue;' + "`n`n" + '                if (elementRecord.Kind == "Marker")'
@@ -78,22 +88,35 @@ jobs:
           )
           foreach ($path in $versionFiles) {
             $text = [IO.File]::ReadAllText($path)
-            $text = $text.Replace('3.0.0', '3.1.1').Replace('3.0.1', '3.1.1').Replace('3.0.2', '3.1.1').Replace('3.1.0', '3.1.1')
+            $text = $text.Replace('3.0.0', '3.2.0').Replace('3.0.1', '3.2.0').Replace('3.0.2', '3.2.0').Replace('3.1.0', '3.2.0').Replace('3.1.1', '3.2.0')
             [IO.File]::WriteAllText($path, $text, $utf8)
           }
 
-          # Verify endpoint/graphics integration and that the ACTUAL startup installer form reports v3.1.1.
+          # Update installer copy to describe the modal-free native-style endpoint workflow.
+          $installerPath = 'revit-build/src/Installer/Program301.cs'
+          $installer = [IO.File]::ReadAllText($installerPath)
+          $installer = $installer.Replace("• Fixes the Revit 2025 endpoint-dialog 'Corresponding button not found' error", "• Native-style START/END picking: click an open connector or click empty space — no mode dialog")
+          $installer = $installer.Replace('The START/END dialog no longer assigns an invalid command-link default button.', 'START/END automatically bind when you snap to an open conduit/electrical connector; empty-space clicks stay free XYZ points.')
+          [IO.File]::WriteAllText($installerPath, $installer, $utf8)
+
+          # Verify the actual v3.2.0 behavior before compiling.
           $verifyModel = [IO.File]::ReadAllText($modelPath)
           $verifyUpdater = [IO.File]::ReadAllText($updaterPath)
+          $verifyCreate = [IO.File]::ReadAllText($createPath)
+          $verifyNative = [IO.File]::ReadAllText('revit-build/src/RevitFlexConduit/FlexConduitV310NativeEndpoints.cs')
           $verifyInstaller = [IO.File]::ReadAllText('revit-build/src/Installer/Program301.cs')
           $verifyInstallerProject = [IO.File]::ReadAllText('revit-build/src/Installer/Installer.csproj')
           if (-not $verifyModel.Contains('FlexNativeEndpointService.SyncAnchors')) { throw 'Native endpoint synchronization patch missing.' }
           if (-not $verifyModel.Contains('FlexNativeEndpointService.SyncGraphics')) { throw 'Flex graphics inheritance patch missing.' }
+          if (-not $verifyUpdater.Contains('internal static bool IsExecuting => _executing;')) { throw 'Updater-safe topology guard missing.' }
           if (-not $verifyUpdater.Contains('FlexNativeEndpointService.StartKind')) { throw 'Native anchor updater patch missing.' }
           if ($verifyModel.Contains('body.Name = $"Flex Conduit') -or $verifyModel.Contains('marker.Name = $"Flex Control')) { throw 'Unsafe DirectShape Name assignment remains.' }
-          if (-not $verifyInstaller.Contains('ProductVersion = "3.1.1"')) { throw 'Installer UI ProductVersion was not updated to v3.1.1.' }
-          if ($verifyInstaller.Contains('3.0.1') -or $verifyInstaller.Contains('3.1.0')) { throw 'Old installer version text remains in Program301.cs.' }
-          if (-not $verifyInstallerProject.Contains('<AssemblyName>RevitFlexConduit2025-v3.1.1-Setup</AssemblyName>')) { throw 'Installer EXE assembly name is not v3.1.1.' }
+          if ($verifyCreate.Contains('Choose the start of the Flex Conduit') -or $verifyCreate.Contains('new TaskDialog($"Flex Conduit — {which}")')) { throw 'Endpoint mode dialog still exists.' }
+          if (-not $verifyCreate.Contains('TryResolveConnectorAtPoint')) { throw 'Automatic connector hit detection missing.' }
+          if ($verifyNative.Contains('NewUnionFitting')) { throw 'Unsafe forced union-fitting creation remains.' }
+          if (-not $verifyInstaller.Contains('ProductVersion = "3.2.0"')) { throw 'Installer UI ProductVersion was not updated to v3.2.0.' }
+          if ($verifyInstaller.Contains('3.0.1') -or $verifyInstaller.Contains('3.1.0') -or $verifyInstaller.Contains('3.1.1')) { throw 'Old installer version text remains in Program301.cs.' }
+          if (-not $verifyInstallerProject.Contains('<AssemblyName>RevitFlexConduit2025-v3.2.0-Setup</AssemblyName>')) { throw 'Installer EXE assembly name is not v3.2.0.' }
 
       - name: Restore plugin
         run: dotnet restore revit-build/src/RevitFlexConduit/RevitFlexConduit.csproj
@@ -114,10 +137,10 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
-          Copy-Item revit-build/src/Installer/bin/Release/net8.0-windows/win-x64/publish/RevitFlexConduit2025-v3.1.1-Setup.exe dist/RevitFlexConduit2025-v3.1.1-Setup.exe
+          Copy-Item revit-build/src/Installer/bin/Release/net8.0-windows/win-x64/publish/RevitFlexConduit2025-v3.2.0-Setup.exe dist/RevitFlexConduit2025-v3.2.0-Setup.exe
 
       - uses: actions/upload-artifact@v4
         with:
-          name: RevitFlexConduit2025-v3.1.1
-          path: dist/RevitFlexConduit2025-v3.1.1-Setup.exe
+          name: RevitFlexConduit2025-v3.2.0
+          path: dist/RevitFlexConduit2025-v3.2.0-Setup.exe
           if-no-files-found: error
