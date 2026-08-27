@@ -21,7 +21,7 @@ jobs:
         run: |
           $utf8 = New-Object System.Text.UTF8Encoding($false)
 
-          # ----- Flex geometry integration -----
+          # Flex geometry integration retained from v3.3.0.
           $modelPath = 'revit-build/src/RevitFlexConduit/FlexConduitV3Models.cs'
           $model = [IO.File]::ReadAllText($modelPath)
           $model = $model.Replace('            body.Name = $"Flex Conduit {record.RunId}";' + [Environment]::NewLine, '')
@@ -39,7 +39,7 @@ jobs:
           }
           [IO.File]::WriteAllText($modelPath, $model, $utf8)
 
-          # ----- Updater safety + diagnostic state -----
+          # Expose updater state to the read-only diagnostic report.
           $updaterPath = 'revit-build/src/RevitFlexConduit/FlexConduitV3Updater.cs'
           $updater = [IO.File]::ReadAllText($updaterPath)
           if (-not $updater.Contains('internal static bool IsExecuting => _executing;')) {
@@ -68,48 +68,44 @@ jobs:
           }
           [IO.File]::WriteAllText($updaterPath, $updater, $utf8)
 
-          # ----- Ensure cancelled runs remove temporary native anchors -----
+          # Cancelled creation removes any temporary native anchors.
           $createPath = 'revit-build/src/RevitFlexConduit/FlexConduitV301Command.cs'
           $create = [IO.File]::ReadAllText($createPath)
           if (-not $create.Contains('FlexNativeEndpointService.DeleteAnchors(doc, runId);')) {
             $needleDelete = '        DirectShape? body = FlexV3Data.FindBody(doc, runId);' + [Environment]::NewLine + '        if (body != null) doc.Delete(body.Id);' + [Environment]::NewLine + '        tx.Commit();'
             $replacementDelete = '        DirectShape? body = FlexV3Data.FindBody(doc, runId);' + [Environment]::NewLine + '        if (body != null) doc.Delete(body.Id);' + [Environment]::NewLine + '        FlexNativeEndpointService.DeleteAnchors(doc, runId);' + [Environment]::NewLine + '        tx.Commit();'
             if ($create.Contains($needleDelete)) { $create = $create.Replace($needleDelete, $replacementDelete) }
-            else {
-              $needleDelete = '        DirectShape? body = FlexV3Data.FindBody(doc, runId);' + "`n" + '        if (body != null) doc.Delete(body.Id);' + "`n" + '        tx.Commit();'
-              $replacementDelete = '        DirectShape? body = FlexV3Data.FindBody(doc, runId);' + "`n" + '        if (body != null) doc.Delete(body.Id);' + "`n" + '        FlexNativeEndpointService.DeleteAnchors(doc, runId);' + "`n" + '        tx.Commit();'
-              if ($create.Contains($needleDelete)) { $create = $create.Replace($needleDelete, $replacementDelete) }
-            }
           }
           [IO.File]::WriteAllText($createPath, $create, $utf8)
 
-          # ----- Add Export Diagnostic Log to the ribbon panel -----
+          # Add Export Diagnostic Log as an always-available ribbon button.
           $appPath = 'revit-build/src/RevitFlexConduit/App301.cs'
           $appText = [IO.File]::ReadAllText($appPath)
           if (-not $appText.Contains('RevitFlexConduit.ExportDiagnosticLog')) {
             $insertBefore = '            TryMovePanelToSystemsAfterConduitFittings(PanelName);'
-            $diagnosticButton = @'
-            if (panel.GetItems().All(i => !string.Equals(i.Name, "RevitFlexConduit.ExportDiagnosticLog", StringComparison.OrdinalIgnoreCase)))
-            {
-                var logData = new PushButtonData(
-                    "RevitFlexConduit.ExportDiagnosticLog",
-                    "Export\nLog",
-                    assemblyPath,
-                    typeof(FlexDiagnosticExportCommand).FullName!);
-                logData.ToolTip = "Export Flex Conduit Diagnostic Log — scans the active model and writes PASS/WARN/FAIL checks for Flex runs, connectors, anchors, diameter inheritance, control points, and spline length.";
-                logData.LongDescription = "Creates a plain-text support log that can be uploaded for troubleshooting. It is read-only and does not modify the Revit model.";
-                logData.LargeImage = LoadImage(Icon32Base64);
-                logData.Image = LoadImage(Icon16Base64);
-                panel.AddItem(logData);
-            }
-
-'@
+            $diagnosticLines = @(
+              '            if (panel.GetItems().All(i => !string.Equals(i.Name, "RevitFlexConduit.ExportDiagnosticLog", StringComparison.OrdinalIgnoreCase)))',
+              '            {',
+              '                var logData = new PushButtonData(',
+              '                    "RevitFlexConduit.ExportDiagnosticLog",',
+              '                    "Export\nLog",',
+              '                    assemblyPath,',
+              '                    typeof(FlexDiagnosticExportCommand).FullName!);',
+              '                logData.ToolTip = "Export Flex Conduit Diagnostic Log - writes PASS/WARN/FAIL checks for Flex runs, connectors, anchors, inherited diameter, control points, and spline length.";',
+              '                logData.LongDescription = "Creates a plain-text support log for troubleshooting. It is read-only and does not modify the Revit model.";',
+              '                logData.LargeImage = LoadImage(Icon32Base64);',
+              '                logData.Image = LoadImage(Icon16Base64);',
+              '                panel.AddItem(logData);',
+              '            }',
+              ''
+            )
+            $diagnosticButton = ($diagnosticLines -join [Environment]::NewLine) + [Environment]::NewLine
             if (-not $appText.Contains($insertBefore)) { throw 'Could not find ribbon insertion point for Export Diagnostic Log.' }
             $appText = $appText.Replace($insertBefore, $diagnosticButton + $insertBefore)
           }
           [IO.File]::WriteAllText($appPath, $appText, $utf8)
 
-          # ----- Hard version bump across installer and Revit DLL -----
+          # Hard version bump across both installer entry points and the Revit DLL.
           $versionFiles = @(
             'revit-build/src/RevitFlexConduit/RevitFlexConduit.csproj',
             'revit-build/src/RevitFlexConduit/App301.cs',
@@ -123,16 +119,7 @@ jobs:
             [IO.File]::WriteAllText($path, $text, $utf8)
           }
 
-          # ----- Installer copy -----
-          $installerPath = 'revit-build/src/Installer/Program301.cs'
-          $installer = [IO.File]::ReadAllText($installerPath)
-          $oldBullet = '• Attempts Systems-tab placement immediately after Conduit Fitting'
-          if ($installer.Contains($oldBullet)) {
-            $installer = $installer.Replace($oldBullet, '• Includes Export Diagnostic Log for model/connector/spline troubleshooting' + "`r`n" + '                   "• Attempts Systems-tab placement immediately after Conduit Fitting')
-          }
-          [IO.File]::WriteAllText($installerPath, $installer, $utf8)
-
-          # ----- Pre-build verification -----
+          # Pre-build verification.
           $verifyModel = [IO.File]::ReadAllText($modelPath)
           $verifyUpdater = [IO.File]::ReadAllText($updaterPath)
           $verifyCreate = [IO.File]::ReadAllText($createPath)
@@ -148,11 +135,11 @@ jobs:
           if (-not $verifyApp.Contains('RevitFlexConduit.ExportDiagnosticLog')) { throw 'Export Diagnostic Log ribbon button missing.' }
           if (-not $verifyApp.Contains('typeof(FlexDiagnosticExportCommand).FullName')) { throw 'Diagnostic command is not wired to ribbon.' }
           if (-not $verifyDiagnostic.Contains('SaveFileDialog')) { throw 'Diagnostic file export dialog missing.' }
-          if (-not $verifyDiagnostic.Contains('PASS  ') -or -not $verifyDiagnostic.Contains('WARN  ') -or -not $verifyDiagnostic.Contains('FAIL  ')) { throw 'PASS/WARN/FAIL diagnostic checks missing.' }
           if (-not $verifyDiagnostic.Contains('Attached native conduit diameter')) { throw 'Diameter inheritance diagnostics missing.' }
-          if (-not $verifyCreate.Contains('EnterToFinishHook')) { throw 'ENTER-to-finish behavior missing from v3.3.x.' }
+          if (-not $verifyDiagnostic.Contains('PASS  ') -or -not $verifyDiagnostic.Contains('WARN  ') -or -not $verifyDiagnostic.Contains('FAIL  ')) { throw 'PASS/WARN/FAIL checks missing.' }
+          if (-not $verifyCreate.Contains('EnterToFinishHook')) { throw 'ENTER-to-finish behavior missing.' }
           if (-not $verifyCreate.Contains('FindSourceConduit')) { throw 'Attached-conduit inheritance logic missing.' }
-          if (-not $verifyInstaller.Contains('ProductVersion = "3.3.1"')) { throw 'Installer UI ProductVersion was not updated to v3.3.1.' }
+          if (-not $verifyInstaller.Contains('ProductVersion = "3.3.1"')) { throw 'Installer UI version is not v3.3.1.' }
           if (-not $verifyInstallerProject.Contains('<AssemblyName>RevitFlexConduit2025-v3.3.1-Setup</AssemblyName>')) { throw 'Installer EXE assembly name is not v3.3.1.' }
 
       - name: Restore plugin
