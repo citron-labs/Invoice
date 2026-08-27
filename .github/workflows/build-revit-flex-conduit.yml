@@ -1,4 +1,4 @@
-name: Build Revit Flex Conduit 2025 v3.0.1
+name: Build Revit Flex Conduit 2025 v3.0.2
 
 on:
   push:
@@ -15,6 +15,42 @@ jobs:
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '8.0.x'
+
+      - name: Apply v3.0.2 Revit compatibility fixes
+        shell: pwsh
+        run: |
+          $utf8 = New-Object System.Text.UTF8Encoding($false)
+
+          # Revit DirectShape names can reject characters that are otherwise harmless
+          # in ordinary strings. Flex identity is already stored in Extensible Storage,
+          # so do not assign user-facing Element.Name values to generated geometry.
+          $modelPath = 'revit-build/src/RevitFlexConduit/FlexConduitV3Models.cs'
+          $model = [IO.File]::ReadAllText($modelPath)
+          $model = $model.Replace('            body.Name = $"Flex Conduit {record.RunId}";' + [Environment]::NewLine, '')
+          $model = $model.Replace('            marker.Name = $"Flex Control {i + 1} [{record.RunId}]";' + [Environment]::NewLine, '')
+          # Also handle LF-only checkout content.
+          $model = $model.Replace('            body.Name = $"Flex Conduit {record.RunId}";' + "`n", '')
+          $model = $model.Replace('            marker.Name = $"Flex Control {i + 1} [{record.RunId}]";' + "`n", '')
+          [IO.File]::WriteAllText($modelPath, $model, $utf8)
+
+          # Hard version bump so Revit/Windows cannot confuse this DLL with v3.0.1.
+          $versionFiles = @(
+            'revit-build/src/RevitFlexConduit/RevitFlexConduit.csproj',
+            'revit-build/src/RevitFlexConduit/App301.cs',
+            'revit-build/src/Installer/Installer.csproj',
+            'revit-build/src/Installer/Program.cs'
+          )
+          foreach ($path in $versionFiles) {
+            $text = [IO.File]::ReadAllText($path)
+            $text = $text.Replace('3.0.1', '3.0.2')
+            [IO.File]::WriteAllText($path, $text, $utf8)
+          }
+
+          # Fail the build immediately if a generated DirectShape Name assignment remains.
+          $verify = [IO.File]::ReadAllText($modelPath)
+          if ($verify.Contains('body.Name = $"Flex Conduit') -or $verify.Contains('marker.Name = $"Flex Control')) {
+            throw 'v3.0.2 name-safety patch did not remove all DirectShape Name assignments.'
+          }
 
       - name: Restore plugin
         run: dotnet restore revit-build/src/RevitFlexConduit/RevitFlexConduit.csproj
@@ -35,10 +71,10 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
-          Copy-Item revit-build/src/Installer/bin/Release/net8.0-windows/win-x64/publish/RevitFlexConduit2025-v3.0.1-Setup.exe dist/RevitFlexConduit2025-v3.0.1-Setup.exe
+          Copy-Item revit-build/src/Installer/bin/Release/net8.0-windows/win-x64/publish/RevitFlexConduit2025-v3.0.2-Setup.exe dist/RevitFlexConduit2025-v3.0.2-Setup.exe
 
       - uses: actions/upload-artifact@v4
         with:
-          name: RevitFlexConduit2025-v3.0.1
-          path: dist/RevitFlexConduit2025-v3.0.1-Setup.exe
+          name: RevitFlexConduit2025-v3.0.2
+          path: dist/RevitFlexConduit2025-v3.0.2-Setup.exe
           if-no-files-found: error
