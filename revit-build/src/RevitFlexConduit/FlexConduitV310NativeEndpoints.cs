@@ -8,11 +8,11 @@ namespace RevitFlexConduit;
 
 /// <summary>
 /// Bridges the plugin-owned spline to Revit's native electrical connector model.
-/// Each connected Flex endpoint owns a short native Conduit anchor. The outer
-/// connector of the anchor is physically connected to the selected conduit,
-/// fitting, or equipment connector; the inner connector is the spline endpoint.
-/// Because the anchors are real Conduit elements, Revit exposes its ordinary
-/// conduit endpoint grips and connector behavior at the ends of a Flex run.
+/// Connected Flex endpoints can own a short native Conduit anchor. Topology-changing
+/// work is deliberately suppressed while an IUpdater is executing; updaters only
+/// read existing anchor geometry and reshape the spline. This prevents Revit from
+/// cancelling user transactions because a third-party updater tried to create or
+/// reconfigure conduit fittings during dynamic update.
 /// </summary>
 internal static class FlexNativeEndpointService
 {
@@ -22,6 +22,7 @@ internal static class FlexNativeEndpointService
     private const double MinAnchorLength = 0.15; // ft
     private const double MaxAnchorLength = 0.50; // ft
     private const double RebuildTolerance = 0.08; // ft
+    private const double ConnectorCoincidenceTolerance = 0.002; // ft
 
     internal static void SyncAnchors(Document doc, FlexV3Record record, View? view)
     {
@@ -30,13 +31,52 @@ internal static class FlexNativeEndpointService
         Conduit? startExisting = FindAnchor(doc, record.RunId, StartKind);
         Conduit? endExisting = FindAnchor(doc, record.RunId, EndKind);
 
-        // On first conversion from the older DirectShape-only implementation,
-        // inherit native electrical properties from the attached conduit run.
+        // Revit's dynamic updater context is intentionally read-only with respect
+        // to MEP topology. Creating/deleting conduit or fittings here can cause the
+        // host transaction to be cancelled with "insufficient space" failures.
+        if (FlexConduitV3Updater.IsExecuting)
+        {
+            SyncFromExistingAnchor(doc, record, true, startExisting);
+            SyncFromExistingAnchor(doc, record, false, endExisting);
+            return;
+        }
+
         if (startExisting == null && endExisting == null)
             InheritInitialSettings(doc, record, view);
 
         SyncOne(doc, record, true, startExisting);
         SyncOne(doc, record, false, endExisting);
+    }
+
+    private static void SyncFromExistingAnchor(Document doc, FlexV3Record record, bool isStart, Conduit? anchor)
+    {
+        if (anchor == null) return;
+        List<Connector> connectors = AnchorConnectors(anchor);
+        if (connectors.Count < 2) return;
+
+        FlexConnectorBinding binding = isStart ? record.Start : record.End;
+        XYZ expectedOuter = binding.Origin.ToXyz();
+        Element? owner = null;
+        Connector? external = null;
+        if (binding.Connected && FlexConnectorUtil.TryResolve(doc, binding, out owner, out external) && external != null)
+            expectedOuter = external.Origin;
+
+        Connector outer = connectors.OrderBy(c => c.Origin.DistanceTo(expectedOuter)).First();
+        Connector inner = connectors.OrderByDescending(c => c.Origin.DistanceTo(expectedOuter)).First();
+
+        List<XYZ> points = record.XyzPoints;
+        int pointIndex = isStart ? 0 : points.Count - 1;
+        points[pointIndex] = inner.Origin;
+        record.Points = points.Select(p => new FlexPointDto(p)).ToList();
+
+        if (owner != null && external != null)
+        {
+            FlexConnectorBinding refreshed = FlexConnectorUtil.CreateBinding(owner, external);
+            XYZ direction = inner.Origin - outer.Origin;
+            if (direction.GetLength() > 1e-8)
+                refreshed.Direction = new FlexPointDto(direction.Normalize());
+            if (isStart) record.Start = refreshed; else record.End = refreshed;
+        }
     }
 
     private static void InheritInitialSettings(Document doc, FlexV3Record record, View? view)
@@ -69,6 +109,13 @@ internal static class FlexNativeEndpointService
             return;
         }
 
+        bool alreadyConnectedToAnchor = anchor != null && IsConnectedToAnchor(external, anchor);
+        if (IsConnectorOccupied(external) && !alreadyConnectedToAnchor)
+        {
+            // Do not break an existing Revit MEP connection just to attach Flex.
+            return;
+        }
+
         List<XYZ> points = record.XyzPoints;
         int pointIndex = isStart ? 0 : points.Count - 1;
         int interiorIndex = isStart ? Math.Min(1, points.Count - 1) : Math.Max(0, points.Count - 2);
@@ -90,25 +137,33 @@ internal static class FlexNativeEndpointService
             ElementId typeId = ResolveTypeId(doc, record.Settings.TypeId);
             ElementId levelId = ResolveLevelId(doc, record.Settings.LevelId);
             XYZ direction = FlexConnectorUtil.GetDirection(external);
-            if (direction.GetLength() < 1e-8) direction = (interiorTarget - externalOrigin).Normalize();
             XYZ toward = interiorTarget - externalOrigin;
-            if (toward.GetLength() > 1e-8 && direction.DotProduct(toward.Normalize()) < 0)
-                direction = -direction;
+
+            if (direction.GetLength() < 1e-8)
+            {
+                direction = toward.GetLength() > 1e-8 ? toward.Normalize() : XYZ.BasisX;
+            }
+            else
+            {
+                direction = direction.Normalize();
+                if (toward.GetLength() > 1e-8 && direction.DotProduct(toward.Normalize()) < 0)
+                    direction = -direction;
+            }
 
             double length = Math.Clamp(record.Settings.Diameter * 2.0, MinAnchorLength, MaxAnchorLength);
-            XYZ inner = externalOrigin + direction.Normalize().Multiply(length);
+            XYZ inner = externalOrigin + direction.Multiply(length);
             if (inner.DistanceTo(externalOrigin) < 0.01)
                 inner = externalOrigin + XYZ.BasisX.Multiply(MinAnchorLength);
 
             anchor = Conduit.Create(doc, typeId, externalOrigin, inner, levelId);
             FlexV3Engine.ApplyNativeConduitSettings(anchor, record.Settings);
             doc.Regenerate();
-            ConnectAnchor(doc, anchor, external);
+            ConnectAnchor(anchor, external);
         }
         else
         {
             FlexV3Engine.ApplyNativeConduitSettings(anchor, record.Settings);
-            EnsureConnected(doc, anchor, external);
+            EnsureConnected(anchor, external);
         }
 
         List<Connector> connectors = AnchorConnectors(anchor);
@@ -117,8 +172,6 @@ internal static class FlexNativeEndpointService
         Connector innerConnector = connectors.OrderByDescending(c => c.Origin.DistanceTo(externalOrigin)).First();
         XYZ innerPoint = innerConnector.Origin;
 
-        // The native anchor direction becomes the spline endpoint tangent. This
-        // makes dragging the free anchor end reshape the spline without a kink.
         XYZ nativeDirection = innerPoint - outer.Origin;
         FlexConnectorBinding refreshed = FlexConnectorUtil.CreateBinding(owner!, external);
         if (nativeDirection.GetLength() > 1e-8)
@@ -135,35 +188,65 @@ internal static class FlexNativeEndpointService
         FlexConduitV3Updater.RegisterElementTriggers(doc, new[] { anchor.Id });
     }
 
-    private static void ConnectAnchor(Document doc, Conduit anchor, Connector external)
+    private static void ConnectAnchor(Conduit anchor, Connector external)
     {
         Connector? local = AnchorConnectors(anchor).OrderBy(c => c.Origin.DistanceTo(external.Origin)).FirstOrDefault();
         if (local == null) return;
+        if (SafeIsConnectedTo(local, external)) return;
+        if (IsConnectorOccupied(external)) return;
 
-        // For conduit-to-conduit endpoints prefer a native union fitting so the
-        // result reads and behaves like an ordinary Revit raceway connection.
-        if (external.Owner is Conduit)
-        {
-            try
-            {
-                doc.Create.NewUnionFitting(local, external);
-                return;
-            }
-            catch { }
-        }
-
-        try
-        {
-            if (!local.IsConnectedTo(external)) local.ConnectTo(external);
-        }
-        catch { }
+        // Never force NewUnionFitting here. Explicit fitting creation can fail for
+        // short/reversed conduit and can poison the surrounding Revit transaction.
+        // Coincident, collinear connectors are connected directly; if Revit rejects
+        // it the Flex binding remains valid without cancelling the user's operation.
+        if (!CanDirectConnect(local, external)) return;
+        try { local.ConnectTo(external); } catch { }
     }
 
-    private static void EnsureConnected(Document doc, Conduit anchor, Connector external)
+    private static void EnsureConnected(Conduit anchor, Connector external)
     {
         Connector? local = AnchorConnectors(anchor).OrderBy(c => c.Origin.DistanceTo(external.Origin)).FirstOrDefault();
-        if (local == null || local.IsConnectedTo(external)) return;
-        ConnectAnchor(doc, anchor, external);
+        if (local == null || SafeIsConnectedTo(local, external)) return;
+        ConnectAnchor(anchor, external);
+    }
+
+    private static bool CanDirectConnect(Connector a, Connector b)
+    {
+        try
+        {
+            if (a.Origin.DistanceTo(b.Origin) > ConnectorCoincidenceTolerance) return false;
+            XYZ da = FlexConnectorUtil.GetDirection(a);
+            XYZ db = FlexConnectorUtil.GetDirection(b);
+            if (da.GetLength() < 1e-8 || db.GetLength() < 1e-8) return true;
+            return Math.Abs(da.Normalize().DotProduct(db.Normalize())) > 0.92;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static bool IsConnectorOccupied(Connector connector)
+    {
+        try { return connector.IsConnected; }
+        catch { return true; }
+    }
+
+    private static bool SafeIsConnectedTo(Connector a, Connector b)
+    {
+        try { return a.IsConnectedTo(b); }
+        catch { return false; }
+    }
+
+    private static bool IsConnectedToAnchor(Connector external, Conduit anchor)
+    {
+        try
+        {
+            foreach (Connector reference in external.AllRefs.Cast<Connector>())
+                if (reference.Owner?.Id == anchor.Id) return true;
+        }
+        catch { }
+        return false;
     }
 
     internal static Conduit? FindAnchor(Document doc, string runId, string kind)
@@ -241,12 +324,9 @@ internal static class FlexNativeEndpointService
             return null;
         if (owner is Conduit direct) return direct;
 
-        // Prefer a conduit physically connected to the selected connector.
         foreach (Connector r in connector.AllRefs.Cast<Connector>())
             if (r.Owner is Conduit c) return c;
 
-        // Fittings may be selected on an open connector. In that case inspect
-        // the fitting's other connector references for the conduit feeding it.
         if (owner != null)
         {
             foreach (Connector c in FlexConnectorUtil.GetConnectors(owner))
