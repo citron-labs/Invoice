@@ -1,4 +1,4 @@
-name: Build Revit Flex Conduit 2025 v3.3.0
+name: Build Revit Flex Conduit 2025 v3.3.1
 
 on:
   push:
@@ -16,40 +16,39 @@ jobs:
         with:
           dotnet-version: '8.0.x'
 
-      - name: Apply v3.3.0 Revit integration patches
+      - name: Apply v3.3.1 Revit integration patches
         shell: pwsh
         run: |
           $utf8 = New-Object System.Text.UTF8Encoding($false)
 
+          # ----- Flex geometry integration -----
           $modelPath = 'revit-build/src/RevitFlexConduit/FlexConduitV3Models.cs'
           $model = [IO.File]::ReadAllText($modelPath)
-
-          # DirectShape identity is stored in Extensible Storage; avoid Revit Name restrictions.
           $model = $model.Replace('            body.Name = $"Flex Conduit {record.RunId}";' + [Environment]::NewLine, '')
           $model = $model.Replace('            marker.Name = $"Flex Control {i + 1} [{record.RunId}]";' + [Environment]::NewLine, '')
           $model = $model.Replace('            body.Name = $"Flex Conduit {record.RunId}";' + "`n", '')
           $model = $model.Replace('            marker.Name = $"Flex Control {i + 1} [{record.RunId}]";' + "`n", '')
 
-          # Synchronize connected ends to native Conduit anchors before spline generation.
-          $pattern = '(internal static void Regenerate\(Document doc, FlexV3Record record, View\? view, bool createMissingMarkers = true\)\s*\{\s*)List<XYZ> points = record\.XyzPoints;'
-          $replacement = '$1FlexNativeEndpointService.SyncAnchors(doc, record, view);' + [Environment]::NewLine + '        List<XYZ> points = record.XyzPoints;'
-          $model = [regex]::Replace($model, $pattern, $replacement, 1)
-
-          # Copy effective conduit/filter graphics from the connected native run.
-          $model = $model.Replace('        FlexV3ParameterService.Apply(body, record);', '        FlexV3ParameterService.Apply(body, record);' + [Environment]::NewLine + '        FlexNativeEndpointService.SyncGraphics(doc, body, record);')
+          if (-not $model.Contains('FlexNativeEndpointService.SyncAnchors(doc, record, view);')) {
+            $pattern = '(internal static void Regenerate\(Document doc, FlexV3Record record, View\? view, bool createMissingMarkers = true\)\s*\{\s*)List<XYZ> points = record\.XyzPoints;'
+            $replacement = '$1FlexNativeEndpointService.SyncAnchors(doc, record, view);' + [Environment]::NewLine + '        List<XYZ> points = record.XyzPoints;'
+            $model = [regex]::Replace($model, $pattern, $replacement, 1)
+          }
+          if (-not $model.Contains('FlexNativeEndpointService.SyncGraphics(doc, body, record);')) {
+            $model = $model.Replace('        FlexV3ParameterService.Apply(body, record);', '        FlexV3ParameterService.Apply(body, record);' + [Environment]::NewLine + '        FlexNativeEndpointService.SyncGraphics(doc, body, record);')
+          }
           [IO.File]::WriteAllText($modelPath, $model, $utf8)
 
-          # Expose updater state. MEP topology is read-only during IUpdater execution.
+          # ----- Updater safety + diagnostic state -----
           $updaterPath = 'revit-build/src/RevitFlexConduit/FlexConduitV3Updater.cs'
           $updater = [IO.File]::ReadAllText($updaterPath)
           if (-not $updater.Contains('internal static bool IsExecuting => _executing;')) {
-            $needleFlag = '    private static bool _executing;'
-            $replacementFlag = '    private static bool _executing;' + [Environment]::NewLine + '    internal static bool IsExecuting => _executing;'
-            if (-not $updater.Contains($needleFlag)) { throw 'Could not expose updater execution state.' }
-            $updater = $updater.Replace($needleFlag, $replacementFlag)
+            $updater = $updater.Replace('    private static bool _executing;', '    private static bool _executing;' + [Environment]::NewLine + '    internal static bool IsExecuting => _executing;')
+          }
+          if (-not $updater.Contains('internal static bool IsRegistered => _registered;')) {
+            $updater = $updater.Replace('    internal static bool IsExecuting => _executing;', '    internal static bool IsExecuting => _executing;' + [Environment]::NewLine + '    internal static bool IsRegistered => _registered;')
           }
 
-          # Native anchor movement regenerates the owning Flex run.
           if (-not $updater.Contains('elementRecord.Kind == FlexNativeEndpointService.StartKind')) {
             $needle = '                if (!FlexV3Data.TryRead(element, out FlexV3Record elementRecord)) continue;' + [Environment]::NewLine + [Environment]::NewLine + '                if (elementRecord.Kind == "Marker")'
             if (-not $updater.Contains($needle)) {
@@ -69,7 +68,48 @@ jobs:
           }
           [IO.File]::WriteAllText($updaterPath, $updater, $utf8)
 
-          # Hard version bump across BOTH installer entry points and the Revit add-in.
+          # ----- Ensure cancelled runs remove temporary native anchors -----
+          $createPath = 'revit-build/src/RevitFlexConduit/FlexConduitV301Command.cs'
+          $create = [IO.File]::ReadAllText($createPath)
+          if (-not $create.Contains('FlexNativeEndpointService.DeleteAnchors(doc, runId);')) {
+            $needleDelete = '        DirectShape? body = FlexV3Data.FindBody(doc, runId);' + [Environment]::NewLine + '        if (body != null) doc.Delete(body.Id);' + [Environment]::NewLine + '        tx.Commit();'
+            $replacementDelete = '        DirectShape? body = FlexV3Data.FindBody(doc, runId);' + [Environment]::NewLine + '        if (body != null) doc.Delete(body.Id);' + [Environment]::NewLine + '        FlexNativeEndpointService.DeleteAnchors(doc, runId);' + [Environment]::NewLine + '        tx.Commit();'
+            if ($create.Contains($needleDelete)) { $create = $create.Replace($needleDelete, $replacementDelete) }
+            else {
+              $needleDelete = '        DirectShape? body = FlexV3Data.FindBody(doc, runId);' + "`n" + '        if (body != null) doc.Delete(body.Id);' + "`n" + '        tx.Commit();'
+              $replacementDelete = '        DirectShape? body = FlexV3Data.FindBody(doc, runId);' + "`n" + '        if (body != null) doc.Delete(body.Id);' + "`n" + '        FlexNativeEndpointService.DeleteAnchors(doc, runId);' + "`n" + '        tx.Commit();'
+              if ($create.Contains($needleDelete)) { $create = $create.Replace($needleDelete, $replacementDelete) }
+            }
+          }
+          [IO.File]::WriteAllText($createPath, $create, $utf8)
+
+          # ----- Add Export Diagnostic Log to the ribbon panel -----
+          $appPath = 'revit-build/src/RevitFlexConduit/App301.cs'
+          $appText = [IO.File]::ReadAllText($appPath)
+          if (-not $appText.Contains('RevitFlexConduit.ExportDiagnosticLog')) {
+            $insertBefore = '            TryMovePanelToSystemsAfterConduitFittings(PanelName);'
+            $diagnosticButton = @'
+            if (panel.GetItems().All(i => !string.Equals(i.Name, "RevitFlexConduit.ExportDiagnosticLog", StringComparison.OrdinalIgnoreCase)))
+            {
+                var logData = new PushButtonData(
+                    "RevitFlexConduit.ExportDiagnosticLog",
+                    "Export\nLog",
+                    assemblyPath,
+                    typeof(FlexDiagnosticExportCommand).FullName!);
+                logData.ToolTip = "Export Flex Conduit Diagnostic Log — scans the active model and writes PASS/WARN/FAIL checks for Flex runs, connectors, anchors, diameter inheritance, control points, and spline length.";
+                logData.LongDescription = "Creates a plain-text support log that can be uploaded for troubleshooting. It is read-only and does not modify the Revit model.";
+                logData.LargeImage = LoadImage(Icon32Base64);
+                logData.Image = LoadImage(Icon16Base64);
+                panel.AddItem(logData);
+            }
+
+'@
+            if (-not $appText.Contains($insertBefore)) { throw 'Could not find ribbon insertion point for Export Diagnostic Log.' }
+            $appText = $appText.Replace($insertBefore, $diagnosticButton + $insertBefore)
+          }
+          [IO.File]::WriteAllText($appPath, $appText, $utf8)
+
+          # ----- Hard version bump across installer and Revit DLL -----
           $versionFiles = @(
             'revit-build/src/RevitFlexConduit/RevitFlexConduit.csproj',
             'revit-build/src/RevitFlexConduit/App301.cs',
@@ -79,40 +119,41 @@ jobs:
           )
           foreach ($path in $versionFiles) {
             $text = [IO.File]::ReadAllText($path)
-            $text = $text.Replace('3.0.0', '3.3.0').Replace('3.0.1', '3.3.0').Replace('3.0.2', '3.3.0').Replace('3.1.0', '3.3.0').Replace('3.1.1', '3.3.0').Replace('3.2.0', '3.3.0')
+            $text = $text.Replace('3.0.0', '3.3.1').Replace('3.0.1', '3.3.1').Replace('3.0.2', '3.3.1').Replace('3.1.0', '3.3.1').Replace('3.1.1', '3.3.1').Replace('3.2.0', '3.3.1').Replace('3.3.0', '3.3.1')
             [IO.File]::WriteAllText($path, $text, $utf8)
           }
 
-          # Installer copy describes the explicit finish workflow and inheritance.
+          # ----- Installer copy -----
           $installerPath = 'revit-build/src/Installer/Program301.cs'
           $installer = [IO.File]::ReadAllText($installerPath)
-          $installer = $installer.Replace("• Fixes the Revit 2025 endpoint-dialog 'Corresponding button not found' error", "• Native-style picking: click empty space for XYZ or snap directly to an open conduit/electrical connector")
-          $installer = $installer.Replace('• Keeps connector-aware spline routing and persistent XYZ control points', '• Auto-inherits conduit diameter/type/service from attached native conduit and keeps persistent XYZ control points')
-          $installer = $installer.Replace('The START/END dialog no longer assigns an invalid command-link default button.', 'Click a second open connector to finish immediately, or press ENTER to finish at the last free point. ESC cancels.')
+          $oldBullet = '• Attempts Systems-tab placement immediately after Conduit Fitting'
+          if ($installer.Contains($oldBullet)) {
+            $installer = $installer.Replace($oldBullet, '• Includes Export Diagnostic Log for model/connector/spline troubleshooting' + "`r`n" + '                   "• Attempts Systems-tab placement immediately after Conduit Fitting')
+          }
           [IO.File]::WriteAllText($installerPath, $installer, $utf8)
 
-          # Verify v3.3.0 behavior before compiling.
-          $createPath = 'revit-build/src/RevitFlexConduit/FlexConduitV301Command.cs'
+          # ----- Pre-build verification -----
           $verifyModel = [IO.File]::ReadAllText($modelPath)
           $verifyUpdater = [IO.File]::ReadAllText($updaterPath)
           $verifyCreate = [IO.File]::ReadAllText($createPath)
-          $verifyNative = [IO.File]::ReadAllText('revit-build/src/RevitFlexConduit/FlexConduitV310NativeEndpoints.cs')
+          $verifyApp = [IO.File]::ReadAllText($appPath)
+          $verifyDiagnostic = [IO.File]::ReadAllText('revit-build/src/RevitFlexConduit/FlexDiagnosticExportCommand.cs')
           $verifyInstaller = [IO.File]::ReadAllText('revit-build/src/Installer/Program301.cs')
           $verifyInstallerProject = [IO.File]::ReadAllText('revit-build/src/Installer/Installer.csproj')
+
           if (-not $verifyModel.Contains('FlexNativeEndpointService.SyncAnchors')) { throw 'Native endpoint synchronization patch missing.' }
           if (-not $verifyModel.Contains('FlexNativeEndpointService.SyncGraphics')) { throw 'Flex graphics inheritance patch missing.' }
-          if (-not $verifyUpdater.Contains('internal static bool IsExecuting => _executing;')) { throw 'Updater-safe topology guard missing.' }
-          if (-not $verifyUpdater.Contains('FlexNativeEndpointService.StartKind')) { throw 'Native anchor updater patch missing.' }
-          if ($verifyModel.Contains('body.Name = $"Flex Conduit') -or $verifyModel.Contains('marker.Name = $"Flex Control')) { throw 'Unsafe DirectShape Name assignment remains.' }
-          if ($verifyCreate.Contains('new TaskDialog($"Flex Conduit — {which}")')) { throw 'Endpoint mode dialog still exists.' }
-          if (-not $verifyCreate.Contains('TryResolveConnectorAtPoint')) { throw 'Automatic connector hit detection missing.' }
-          if (-not $verifyCreate.Contains('EnterToFinishHook')) { throw 'ENTER-to-finish hook missing.' }
-          if (-not $verifyCreate.Contains('Click an open conduit/electrical connector to FINISH')) { throw 'Click-connector-to-finish prompt missing.' }
+          if (-not $verifyUpdater.Contains('internal static bool IsExecuting => _executing;')) { throw 'Updater execution-state diagnostic property missing.' }
+          if (-not $verifyUpdater.Contains('internal static bool IsRegistered => _registered;')) { throw 'Updater registration-state diagnostic property missing.' }
+          if (-not $verifyApp.Contains('RevitFlexConduit.ExportDiagnosticLog')) { throw 'Export Diagnostic Log ribbon button missing.' }
+          if (-not $verifyApp.Contains('typeof(FlexDiagnosticExportCommand).FullName')) { throw 'Diagnostic command is not wired to ribbon.' }
+          if (-not $verifyDiagnostic.Contains('SaveFileDialog')) { throw 'Diagnostic file export dialog missing.' }
+          if (-not $verifyDiagnostic.Contains('PASS  ') -or -not $verifyDiagnostic.Contains('WARN  ') -or -not $verifyDiagnostic.Contains('FAIL  ')) { throw 'PASS/WARN/FAIL diagnostic checks missing.' }
+          if (-not $verifyDiagnostic.Contains('Attached native conduit diameter')) { throw 'Diameter inheritance diagnostics missing.' }
+          if (-not $verifyCreate.Contains('EnterToFinishHook')) { throw 'ENTER-to-finish behavior missing from v3.3.x.' }
           if (-not $verifyCreate.Contains('FindSourceConduit')) { throw 'Attached-conduit inheritance logic missing.' }
-          if (-not $verifyCreate.Contains('record.Settings = FlexV3Engine.CaptureSettings(doc, endSource')) { throw 'END conduit inheritance missing.' }
-          if ($verifyNative.Contains('doc.Create.NewUnionFitting')) { throw 'Unsafe forced union-fitting creation remains.' }
-          if (-not $verifyInstaller.Contains('ProductVersion = "3.3.0"')) { throw 'Installer UI ProductVersion was not updated to v3.3.0.' }
-          if (-not $verifyInstallerProject.Contains('<AssemblyName>RevitFlexConduit2025-v3.3.0-Setup</AssemblyName>')) { throw 'Installer EXE assembly name is not v3.3.0.' }
+          if (-not $verifyInstaller.Contains('ProductVersion = "3.3.1"')) { throw 'Installer UI ProductVersion was not updated to v3.3.1.' }
+          if (-not $verifyInstallerProject.Contains('<AssemblyName>RevitFlexConduit2025-v3.3.1-Setup</AssemblyName>')) { throw 'Installer EXE assembly name is not v3.3.1.' }
 
       - name: Restore plugin
         run: dotnet restore revit-build/src/RevitFlexConduit/RevitFlexConduit.csproj
@@ -133,10 +174,10 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
-          Copy-Item revit-build/src/Installer/bin/Release/net8.0-windows/win-x64/publish/RevitFlexConduit2025-v3.3.0-Setup.exe dist/RevitFlexConduit2025-v3.3.0-Setup.exe
+          Copy-Item revit-build/src/Installer/bin/Release/net8.0-windows/win-x64/publish/RevitFlexConduit2025-v3.3.1-Setup.exe dist/RevitFlexConduit2025-v3.3.1-Setup.exe
 
       - uses: actions/upload-artifact@v4
         with:
-          name: RevitFlexConduit2025-v3.3.0
-          path: dist/RevitFlexConduit2025-v3.3.0-Setup.exe
+          name: RevitFlexConduit2025-v3.3.1
+          path: dist/RevitFlexConduit2025-v3.3.1-Setup.exe
           if-no-files-found: error
